@@ -1,0 +1,37 @@
+{
+  "name": "m365-gateway-complete",
+  "version": "0.1.4",
+  "description": "Complete Microsoft 365 gateway package for Cloudflare Workers, Node/Docker, and optional fixed-target egress relay deployments",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:server": "wrangler deploy --dry-run --outdir dist/server-worker",
+    "start": "node server.mjs",
+    "start:production": "node server.mjs",
+    "healthcheck": "node scripts/server-healthcheck.mjs",
+    "check": "npm run check:no-docs && npm run check:deploy && npm run check:functional && npm run types && npm run typecheck && npm run check:ui && npm test && npm run deploy:dry",
+    "check:deploy": "node scripts/check-deploy-helpers.mjs",
+    "check:functional": "node scripts/check-functional-safety.mjs",
+    "check:no-docs": "node scripts/check-no-docs.mjs",
+    "check:ui": "node scripts/check-admin-ui.mjs",
+    "deploy": "node deploy-cloudflare.mjs",
+    "deploy:one-click": "node deploy-cloudflare.mjs",
+    "deploy:dry": "node deploy-cloudflare.mjs --dry-run --yes --client-id 00000000-0000-0000-0000-000000000000",
+    "deploy:temporary": "wrangler deploy --temporary",
+    "dev": "wrangler dev",
+    "typecheck": "tsc --noEmit",
+    "types": "wrangler types src/worker-configuration.d.ts",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "latest",
+    "typescript": "latest",
+    "vitest": "^4.1.0",
+    "wrangler": "latest",
+    "miniflare": "latest"
+  },
+  "overrides": {
+    "sharp": "0.35.5",
+    "undici": "8.11.2"
+  }
+}

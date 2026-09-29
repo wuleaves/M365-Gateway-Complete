@@ -1,0 +1,17 @@
+services:
+  gateway:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8787
+      DATA_DIR: /data
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?required}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?required}
+    volumes:
+      - gateway-data:/data
+
+volumes:
+  gateway-data:
