@@ -66,6 +66,7 @@ describe("model catalog and ChatHub tones", () => {
   it("advertises verified and explicitly tenant-dependent routes", () => {
     const ids = modelCatalog().map((model) => model.id);
     expect(ids).toEqual([
+      "m365-image",
       "gpt-5.2", "gpt-5.2-reasoning", "gpt-5.3", "gpt-5.3-reasoning",
       "gpt-5.4", "gpt-5.4-reasoning", "gpt-5.5", "gpt-5.5-reasoning",
       "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-reasoning",
@@ -74,6 +75,7 @@ describe("model catalog and ChatHub tones", () => {
     ]);
     expect(ids.some((id) => /(?:quick|opus|fable)/iu.test(id))).toBe(false);
     expect(modelCatalog().filter((model) => model.x_m365_availability === "tenant_dependent").map((model) => model.id)).toEqual([
+      "m365-image",
       "gpt-5.2", "gpt-5.2-reasoning", "gpt-5.3", "gpt-5.3-reasoning",
       "gpt-5.4", "gpt-5.4-reasoning", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra",
     ]);
@@ -101,6 +103,11 @@ describe("model catalog and ChatHub tones", () => {
   it("exposes consistent reasoning selection and only live-verified public summary capability", () => {
     for (const model of modelCatalog()) {
       const codex = codexModelCatalog().models.find((entry) => entry.slug === model.id);
+      if (model.id === "m365-image") {
+        expect(codex).toBeUndefined();
+        expect(model.capabilities).toMatchObject({ image_generation: true, chat_completions: false });
+        continue;
+      }
       expect(model.supported_reasoning_levels).toEqual(codex?.supported_reasoning_levels);
       expect(model.default_reasoning_level).toEqual(codex?.default_reasoning_level);
       const summaryVerified = ["gpt-5.6-sol", "gpt-5.6-reasoning"].includes(String(model.id));

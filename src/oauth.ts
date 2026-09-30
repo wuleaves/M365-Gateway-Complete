@@ -9,6 +9,12 @@ interface MicrosoftTokenResponse {
   error_description?: string;
 }
 
+export interface ScopedAccessToken {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+}
+
 const TOKEN_REQUEST_TIMEOUT_MS = 30_000;
 
 function tokenFailure(response: Response, payload: MicrosoftTokenResponse): string {
@@ -118,4 +124,42 @@ export function refreshToken(env: Env, token: OAuthTokenSet): Promise<OAuthToken
     refresh_token: token.refreshToken,
     scope: env.M365_SCOPE,
   })).then((fresh) => ({ ...fresh, refreshToken: fresh.refreshToken || token.refreshToken }));
+}
+
+/** Exchange an existing refresh token for a narrowly scoped service token.
+ * The caller owns persistence of a rotated refresh token; the primary
+ * ChatHub access token must never be replaced with this different audience. */
+export async function scopedAccessToken(env: Env, token: OAuthTokenSet, scope: string): Promise<ScopedAccessToken> {
+  if (!token.refreshToken) throw new Error("MICROSOFT_REFRESH_TOKEN_MISSING");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), TOKEN_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${env.M365_AUTHORITY.replace(/\/$/u, "")}/oauth2/v2.0/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: env.M365_CLIENT_ID,
+        grant_type: "refresh_token",
+        refresh_token: token.refreshToken,
+        scope,
+      }),
+      signal: controller.signal,
+    });
+    let payload: MicrosoftTokenResponse = {};
+    try {
+      const parsed = await response.json<unknown>();
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) payload = parsed as MicrosoftTokenResponse;
+    } catch { /* handled by the stable failure below */ }
+    if (!response.ok || payload.error || !payload.access_token) throw new Error(tokenFailure(response, payload));
+    return {
+      accessToken: payload.access_token,
+      refreshToken: payload.refresh_token ?? token.refreshToken,
+      expiresAt: Date.now() + Math.max(60, payload.expires_in ?? 3_600) * 1_000,
+    };
+  } catch (cause) {
+    if (cause instanceof Error && cause.message.startsWith("MICROSOFT_")) throw cause;
+    throw new Error("MICROSOFT_TOKEN_SERVICE_UNAVAILABLE");
+  } finally {
+    clearTimeout(timeout);
+  }
 }

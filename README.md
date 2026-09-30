@@ -1,6 +1,6 @@
 # M365 Gateway 完整包
 
-版本：`0.1.3`
+版本：`0.2.0`
 部署形态：Cloudflare Workers，或 Node.js/Docker 独立服务器；均可搭配固定目标 Go 出口 Relay
 
 本完整包以 `M365-Gateway-Cloudflare-UI-Mobile-20260917-r9` 为主线，合并了此前各源码包中仍被当前实现引用但在 r9 压缩包中漏装的可选 Go 出口 Relay，并保留 Cloudflare、Node/Docker、MFA、现代化管理界面与完整测试。
@@ -94,18 +94,18 @@ Codex 的 Responses 续接允许省略重复的固定调用方工具声明（`ex
 - WebSocket 单帧 4,000,000 字符、单回答 8,000,000 字符、最多 128 个工具定义、AI 请求体 8 MiB 的硬上限。
 - 上游错误固定映射；异常、日志和 API 响应均不回显 ChatHub URL、OAuth token 或请求密钥。
 - 管理后台展示全局/每账号的聚合调用与 Token 统计；重置操作会原子清空统计。逐请求诊断环完整保留错误、取消和慢请求，并对普通成功请求做确定性 1/64 采样。诊断只接受内部请求 ID、HTTP 方法、无查询参数路径、状态码和有界耗时，不保存请求正文、邮箱、令牌、API Key 或任意异常文本。
-- `/api/admin/settings` 返回部署形态的显式能力矩阵；Cloudflare 原生版不支持的账号代理、文件系统路径、进程启动和运行时设置写入均标记为 `false`，前端不会显示伪操作入口。
+- `/api/admin/settings` 返回部署形态和可写的有界运行时设置；支持首 Token 超时、模型别名和 ChatHub tone 映射。任意代理池、文件系统路径和进程启动仍明确标记为不支持。
 
 当前模型目录分为两组：
 
 - 已验证稳定路由：`gpt-5.5`、`gpt-5.5-reasoning`、`gpt-5.6-sol`（`gpt-5.6` 别名）、`gpt-5.6-reasoning`、`claude-sonnet`、`claude-sonnet-reasoning`。
-- 租户依赖候选：`gpt-5.2`、`gpt-5.2-reasoning`、`gpt-5.3`、`gpt-5.3-reasoning`、`gpt-5.4`、`gpt-5.4-reasoning`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-6-astra`。这些条目带 `x_m365_availability: tenant_dependent`，必须在实际租户中通过模型测试后才能视为可用。
+- 租户依赖候选：`gpt-5.2`、`gpt-5.2-reasoning`、`gpt-5.3`、`gpt-5.3-reasoning`、`gpt-5.4`、`gpt-5.4-reasoning`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-6-astra`、`m365-image`。这些条目带 `x_m365_availability: tenant_dependent`，必须在实际租户中通过模型测试后才能视为可用。
 
-模型目录只声明已经验证的文本、流式、Responses、工具和推理能力。服务端生图功能已移除：图片生成、编辑和变体接口明确返回不支持，不调用 Microsoft、不选账号、不申请生成任务。`image_generation` 保持 `false`；旧的 `M365_TEST_IMAGE_GENERATION` 开关不再发起探测。图片输入附件、识图路径以及调用方提供的 `view_image` 等本地工具仍保留，但真实视觉能力尚未完成验收，`vision` 仍为 `false`。`scripts/full-functional.mjs` 默认跳过图片输入，仅在明确具备权限并设置 `M365_TEST_VISION_INPUT=1` 时执行视觉探测。音频、Realtime 和语音没有可用实现，不得伪装成可用。
+文本模型保持原有声明。新增的 `m365-image` 是租户依赖的生图专用路由，只在标准 `/v1/models` 中声明 `image_generation: true`，不会进入 Codex 文本模型清单。`/v1/images/generations`、`/v1/images/edits` 和 `/v1/images/variations` 已接入有界请求预检与 Microsoft 生图路由；实际可用性仍取决于租户是否开通该功能。Chat/Responses 现在可以接收图片、文件和音频附件，并使用整个请求级的数量/大小限制与私网地址拒绝。Realtime 和实时语音仍未实现。
 
 `gpt-5.6-sol` 在未指定 reasoning effort 时使用低延迟 Chat 路由；需要更深推理时显式请求 `reasoning_effort=medium/high` 或使用 `gpt-5.6-reasoning`。未验证候选不会伪装成稳定能力。Microsoft 偶尔会用 HTTP 200 包装容量占位句，网关会将已识别的占位句转换为可重试的 429，避免把“无工具调用”的假成功交给 Codex/OpenCode。
 
-### M365-Copilot2API v0.7.1 协议兼容优化
+### M365-Copilot2API 可移植功能升级（0.2.0）
 
 本版本为 Cloudflare 运行边界独立实现了以下兼容行为，没有复制官方 Go 源码：
 
@@ -113,8 +113,17 @@ Codex 的 Responses 续接允许省略重复的固定调用方工具声明（`ex
 - Responses 接受并回显最多 16 项有界 `metadata`；`metadata.copilot_temp_session=true` 与 `new_conversation=true` 都会创建独立临时会话，避免复用已有上游坐标。
 - 非流式与流式输出统一清理 Microsoft 私有引用控制标记，并能处理标记跨 WebSocket/SSE 分块的情况。
 - Responses 工具调用继续保证 `response.output_item.added` 中的 `id`、`call_id` 和 `name` 非空。
+- Anthropic Messages 同时支持非流式 `thinking` 块和流式 `thinking_delta`；来源仍仅限 Microsoft 公开推理摘要。
+- `X-M365-Session-Id`、`session_key` 和 `conversation_id` 可显式续接；`/v1/sessions` 提供按 API Key 隔离的创建、列表、检查和删除。
+- `/v1/mcp/message`、`/v1/mcp/tools` 和 `/v1/mcp/sse` 提供有界 MCP 兼容，内置记忆、自定义指令和插件查询工具。
+- `/api/plugins` 读取 Microsoft 365 插件目录并按账号做 5 分钟内存缓存。
+- `/v1/memory/flags`、`/v1/memory/instructions` 和 `/v1/memory/settings` 接入 Microsoft 个性化内存；读取需 API Key，写入/删除需管理员会话。
+- `/api/conversations` 及其 `delete`/`cleanup` 管理云端历史；这些路由只允许管理员使用。
+- `/api/admin/models`、`/api/admin/settings`、`/api/admin/usage` 分别管理模型映射、首输出超时和 API-Key/模型/端点维度统计。
+- `/api/accounts/activate`、`configure`、`token-health`、`clear-cooldown`、`batch` 提供受管理员保护的账号健康和批量操作。
+- `/api/admin/egress/check` 只检查预配置的固定 Relay，不暴露 URL/HMAC，不开放任意代理。
 
-`M365_FORCE_IPV4`、本地通用代理池、桌面自动启动和本地进程热加载不属于 Cloudflare Worker 可控制的运行层，因此没有加入 CF 路径。图片生成仍保持关闭，直到真实租户完成独立验收。
+`M365_FORCE_IPV4`、本地通用代理池、桌面自动启动、本地进程热加载、文件系统自更新、API Key 明文回读和完整上游正文日志不属于 Cloudflare Worker 安全可移植集，因此仍未加入。
 
 ## 本地验证
 

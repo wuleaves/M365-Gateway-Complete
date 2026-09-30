@@ -48,7 +48,7 @@ describe("Worker HTTP contract", () => {
     expect(response.status).toBe(200);
   });
 
-  it("rejects every server-side image generation endpoint before parsing a body or contacting an account", async () => {
+  it("preflights malformed image requests before contacting an account", async () => {
     for (const path of ["generations", "edits", "variations"]) {
       const response = await SELF.fetch(`https://example.com/v1/images/${path}`, {
         method: "POST",
@@ -58,12 +58,46 @@ describe("Worker HTTP contract", () => {
         },
         body: "not-json",
       });
-      expect(response.status).toBe(501);
-      expect(response.headers.get("X-M365-Error-Code")).toBe("image_generation_not_supported");
+      expect(response.status).toBe(400);
+      const expectedCode = path === "generations" ? "invalid_json" : "invalid_image_request";
+      expect(response.headers.get("X-M365-Error-Code")).toBe(expectedCode);
       await expect(response.json()).resolves.toMatchObject({
-        error: { code: "image_generation_not_supported" },
+        error: { code: expectedCode },
       });
     }
+  });
+
+  it("exposes bounded MCP discovery and explicit session lifecycle", async () => {
+    const headers = {
+      Authorization: "Bearer m365_test_deployment_key_1234567890",
+      "Content-Type": "application/json",
+    };
+    const tools = await SELF.fetch("https://example.com/v1/mcp/tools", { headers });
+    expect(tools.status).toBe(200);
+    await expect(tools.json()).resolves.toMatchObject({ tools: [
+      { name: "m365_memory_flags" },
+      { name: "m365_memory_instructions" },
+      { name: "m365_plugins" },
+    ] });
+    const initialize = await SELF.fetch("https://example.com/v1/mcp/message", {
+      method: "POST", headers,
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    await expect(initialize.json()).resolves.toMatchObject({
+      jsonrpc: "2.0", id: 1, result: { capabilities: { tools: { listChanged: false } } },
+    });
+
+    const created = await SELF.fetch("https://example.com/v1/sessions", {
+      method: "POST", headers,
+      body: JSON.stringify({ id: "worker-session-fixture", endpoint: "responses", model: "gpt-5.6-sol" }),
+    });
+    expect(created.status).toBe(201);
+    await expect(created.json()).resolves.toMatchObject({ id: "worker-session-fixture", object: "session", exists: false });
+    const listed = await SELF.fetch("https://example.com/v1/sessions", { headers });
+    const listedBody = await listed.json<{ data: Array<{ id: string }> }>();
+    expect(listedBody.data.some((session) => session.id === "worker-session-fixture")).toBe(true);
+    const deleted = await SELF.fetch("https://example.com/v1/sessions/worker-session-fixture", { method: "DELETE", headers });
+    await expect(deleted.json()).resolves.toMatchObject({ id: "worker-session-fixture", deleted: true });
   });
 
   it("restricts health to GET and attaches a stable error code", async () => {

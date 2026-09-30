@@ -2169,6 +2169,43 @@ export class ChatSession extends DurableObject<Env> {
     return result === "evicted" ? "revoked" : result;
   }
 
+  /** Privacy-safe session metadata for the explicit-session control plane.
+   * Upstream conversation/account identifiers and prompt history are never
+   * returned. */
+  async inspect(): Promise<{
+    exists: boolean;
+    busy: boolean;
+    started: boolean;
+    pendingTool: boolean;
+    updatedAt: string | null;
+  }> {
+    const row = this.ctx.storage.sql.exec<{
+      lease_until: number; committed: number; pending_call_id: string; updated_at: number; record_kind: string;
+    }>(
+      "SELECT lease_until,committed,pending_call_id,updated_at,record_kind FROM state WHERE singleton=1",
+    ).toArray()[0];
+    if (!row || row.record_kind === "alias") {
+      return { exists: false, busy: false, started: false, pendingTool: false, updatedAt: null };
+    }
+    return {
+      exists: true,
+      busy: row.lease_until > Date.now(),
+      started: Boolean(row.committed),
+      pendingTool: Boolean(row.pending_call_id),
+      updatedAt: new Date(row.updated_at).toISOString(),
+    };
+  }
+
+  async reset(): Promise<"deleted" | "absent" | "busy"> {
+    const row = this.ctx.storage.sql.exec<{ lease_until: number; record_kind: string; alias_generation: string }>(
+      "SELECT lease_until,record_kind,alias_generation FROM state WHERE singleton=1",
+    ).toArray()[0];
+    if (!row) return "absent";
+    if (row.lease_until > Date.now()) return "busy";
+    await this.deleteCurrentState(row);
+    return "deleted";
+  }
+
   async alarm(): Promise<void> {
     // Flush the optional cold outbox before normal TTL handling. The flush is
     // serialized and failure-tolerant; it never changes the hot session state.

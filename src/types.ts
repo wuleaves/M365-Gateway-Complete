@@ -70,7 +70,7 @@ export interface PublicAccount {
   refreshScheduledAt: string | null;
   health: "healthy" | "cooldown" | "isolated";
   cooldownUntil: string | null;
-  failureKind: "" | "rate_limit" | "transient" | "auth" | "permanent";
+  failureKind: "" | "rate_limit" | "transient" | "auth" | "permanent" | "manual";
   requestCount: number;
   errorCount: number;
   tokenIn: number;
@@ -85,6 +85,9 @@ export interface RequestMetricInput {
   requestId: string;
   /** Final account selected for this request. Empty when routing never began. */
   accountId?: string | null;
+  apiKeyId?: string | null;
+  model?: string;
+  endpoint?: string;
   /** HTTP status visible to the client, which can still be 200 for an SSE error. */
   status: number;
   /** Protocol-level terminal state, independent of the HTTP status. */
@@ -95,6 +98,17 @@ export interface RequestMetricInput {
   durationMs?: number;
   tokenIn?: number;
   tokenOut?: number;
+}
+
+export interface UsageDimensionStats {
+  apiKeyId: string;
+  model: string;
+  endpoint: string;
+  requestCount: number;
+  errorCount: number;
+  tokenIn: number;
+  tokenOut: number;
+  lastRequestAt: string | null;
 }
 
 export type RequestSemanticStatus = "complete" | "error" | "cancel";

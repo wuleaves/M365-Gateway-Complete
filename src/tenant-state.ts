@@ -1,9 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 import { classifyAccountFailure } from "./account-routing";
 import { decryptJSON, encryptJSON, passwordRecord, randomToken, sha256, verifyPassword } from "./crypto";
-import { refreshToken } from "./oauth";
+import { refreshToken, scopedAccessToken, type ScopedAccessToken } from "./oauth";
 import { parsePasskeyRegistration, randomChallenge, verifyPasskeyAssertion, verifyTOTP } from "./mfa";
 import type { MigratedAccountInput } from "./migration";
+import { normalizeRuntimeModelConfiguration, type RuntimeModelConfiguration } from "./models";
 import type {
   AccountEgress,
   DiagnosticInput,
@@ -15,6 +16,7 @@ import type {
   RequestMetricInput,
   RequestMetricRecord,
   RequestSemanticStatus,
+  UsageDimensionStats,
 } from "./types";
 
 interface AccountRow {
@@ -98,6 +100,25 @@ interface APIKeyRow {
   last_used_at: number;
   expires_at: number;
   revoked: number;
+}
+
+export interface APIKeyAuthorization {
+  id: string;
+  prefix: string;
+}
+
+export interface PublicSessionRecord {
+  id: string;
+  endpoint: string;
+  model: string;
+  createdAt: string;
+  lastUsedAt: string;
+  messageCount: number;
+}
+
+export interface GatewayRuntimeConfiguration {
+  firstOutputTimeoutMs: number;
+  models: RuntimeModelConfiguration;
 }
 
 export const MAX_API_KEY_NAME_CHARACTERS = 100;
@@ -213,6 +234,7 @@ export class TenantState extends DurableObject<Env> {
   private diagnosticWritesSincePrune = 0;
   private readonly refreshInFlight = new Map<string, Promise<OAuthTokenSet>>();
   private readonly credentialMirrorInFlight = new Map<string, Promise<void>>();
+  private readonly scopedTokenCache = new Map<string, ScopedAccessToken>();
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => this.migrate());
@@ -341,6 +363,17 @@ export class TenantState extends DurableObject<Env> {
         token_out INTEGER NOT NULL DEFAULT 0 CHECK(token_out>=0),
         last_request_at INTEGER NOT NULL DEFAULT 0 CHECK(last_request_at>=0)
       );
+      CREATE TABLE IF NOT EXISTS request_dimension_stats (
+        api_key_id TEXT NOT NULL,
+        model TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        request_count INTEGER NOT NULL DEFAULT 0 CHECK(request_count>=0),
+        error_count INTEGER NOT NULL DEFAULT 0 CHECK(error_count>=0),
+        token_in INTEGER NOT NULL DEFAULT 0 CHECK(token_in>=0),
+        token_out INTEGER NOT NULL DEFAULT 0 CHECK(token_out>=0),
+        last_request_at INTEGER NOT NULL DEFAULT 0 CHECK(last_request_at>=0),
+        PRIMARY KEY(api_key_id,model,endpoint)
+      );
       CREATE TABLE IF NOT EXISTS recorded_request_metrics (
         request_hash TEXT PRIMARY KEY,
         recorded_at INTEGER NOT NULL,
@@ -361,6 +394,17 @@ export class TenantState extends DurableObject<Env> {
         status INTEGER NOT NULL,
         duration_ms INTEGER NOT NULL,
         code TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS session_registry (
+        api_key_id TEXT NOT NULL,
+        public_id TEXT NOT NULL,
+        object_key TEXT NOT NULL,
+        endpoint TEXT NOT NULL DEFAULT 'chat.completions',
+        model TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        last_used_at INTEGER NOT NULL,
+        message_count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(api_key_id,public_id)
       );
     `);
     // The prune counters are intentionally kept in memory so terminal writes
@@ -415,6 +459,35 @@ export class TenantState extends DurableObject<Env> {
       key,
       value,
     );
+  }
+
+  async runtimeConfiguration(): Promise<GatewayRuntimeConfiguration> {
+    const raw = this.meta("runtime_configuration");
+    if (!raw) return { firstOutputTimeoutMs: 75_000, models: { aliases: {}, models: [] } };
+    try {
+      const parsed = JSON.parse(raw) as { firstOutputTimeoutMs?: unknown; models?: unknown };
+      const timeout = Number(parsed.firstOutputTimeoutMs);
+      return {
+        firstOutputTimeoutMs: Number.isInteger(timeout) && timeout >= 5_000 && timeout <= 300_000 ? timeout : 75_000,
+        models: normalizeRuntimeModelConfiguration(parsed.models),
+      };
+    } catch {
+      return { firstOutputTimeoutMs: 75_000, models: { aliases: {}, models: [] } };
+    }
+  }
+
+  async setRuntimeConfiguration(value: unknown): Promise<GatewayRuntimeConfiguration> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("INVALID_RUNTIME_CONFIGURATION");
+    const input = value as { firstOutputTimeoutMs?: unknown; models?: unknown };
+    const current = await this.runtimeConfiguration();
+    const timeout = input.firstOutputTimeoutMs === undefined ? current.firstOutputTimeoutMs : Number(input.firstOutputTimeoutMs);
+    if (!Number.isInteger(timeout) || timeout < 5_000 || timeout > 300_000) throw new Error("INVALID_RUNTIME_CONFIGURATION");
+    const config = {
+      firstOutputTimeoutMs: timeout,
+      models: input.models === undefined ? current.models : normalizeRuntimeModelConfiguration(input.models),
+    };
+    this.setMeta("runtime_configuration", JSON.stringify(config));
+    return config;
   }
 
   /**
@@ -1095,6 +1168,13 @@ export class TenantState extends DurableObject<Env> {
       : undefined;
     const accountId = found ? requestedAccountId : "";
     const accountRef = retainDetail && accountId ? await sha256(`metric-account:${accountId}`) : "";
+    const requestedAPIKeyId = typeof input.apiKeyId === "string" ? input.apiKeyId.trim() : "";
+    const apiKeyFound = requestedAPIKeyId
+      ? this.ctx.storage.sql.exec<{ found: number }>("SELECT 1 AS found FROM api_keys WHERE id=?", requestedAPIKeyId).toArray()[0]
+      : undefined;
+    const apiKeyId = apiKeyFound ? requestedAPIKeyId : "";
+    const model = safeDiagnosticIdentifier(typeof input.model === "string" ? input.model.toLowerCase() : "", 128, "");
+    const endpoint = safeDiagnosticIdentifier(typeof input.endpoint === "string" ? input.endpoint.toLowerCase() : "", 128, "");
 
     const now = Date.now();
     const status = boundedInteger(input.status, 999);
@@ -1140,6 +1220,22 @@ export class TenantState extends DurableObject<Env> {
            token_in=token_in+excluded.token_in,token_out=token_out+excluded.token_out,
            last_request_at=excluded.last_request_at`,
           accountId,
+          errorCount,
+          tokenIn,
+          tokenOut,
+          now,
+        );
+      }
+      if (apiKeyId && model && endpoint) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO request_dimension_stats(api_key_id,model,endpoint,request_count,error_count,token_in,token_out,last_request_at)
+           VALUES(?,?,?,1,?,?,?,?) ON CONFLICT(api_key_id,model,endpoint) DO UPDATE SET
+           request_count=request_count+1,error_count=error_count+excluded.error_count,
+           token_in=token_in+excluded.token_in,token_out=token_out+excluded.token_out,
+           last_request_at=excluded.last_request_at`,
+          apiKeyId,
+          model,
+          endpoint,
           errorCount,
           tokenIn,
           tokenOut,
@@ -1223,6 +1319,27 @@ export class TenantState extends DurableObject<Env> {
     };
   }
 
+  async usageDimensionStats(limit = 500): Promise<UsageDimensionStats[]> {
+    const boundedLimit = Math.max(1, Math.min(2_000, Math.trunc(limit) || 500));
+    return this.ctx.storage.sql.exec<{
+      api_key_id: string; model: string; endpoint: string; request_count: number; error_count: number;
+      token_in: number; token_out: number; last_request_at: number;
+    }>(
+      `SELECT api_key_id,model,endpoint,request_count,error_count,token_in,token_out,last_request_at
+       FROM request_dimension_stats ORDER BY last_request_at DESC LIMIT ?`,
+      boundedLimit,
+    ).toArray().map((row) => ({
+      apiKeyId: row.api_key_id,
+      model: row.model,
+      endpoint: row.endpoint,
+      requestCount: row.request_count,
+      errorCount: row.error_count,
+      tokenIn: row.token_in,
+      tokenOut: row.token_out,
+      lastRequestAt: row.last_request_at > 0 ? new Date(row.last_request_at).toISOString() : null,
+    }));
+  }
+
   async resetRequestStats(): Promise<GatewayStats> {
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
@@ -1230,6 +1347,7 @@ export class TenantState extends DurableObject<Env> {
       );
       this.ctx.storage.sql.exec("DELETE FROM account_request_stats");
       this.ctx.storage.sql.exec("DELETE FROM recorded_request_metrics");
+      this.ctx.storage.sql.exec("DELETE FROM request_dimension_stats");
     });
     return this.statsSnapshot();
   }
@@ -1596,6 +1714,37 @@ export class TenantState extends DurableObject<Env> {
     this.storeActiveAccountRoute(route, { accountId, epoch: route.epoch + 1 });
     await this.scheduleNextAlarm();
     return true;
+  }
+
+  async configureAccount(
+    id: string,
+    input: { enabled?: boolean; egress?: AccountEgress },
+  ): Promise<PublicAccount | null> {
+    const accountId = id.trim();
+    if (!accountId) return null;
+    const exists = this.ctx.storage.sql.exec<{ found: number }>("SELECT 1 AS found FROM accounts WHERE id=?", accountId).toArray()[0];
+    if (!exists) return null;
+    if (input.egress !== undefined) {
+      if (!["direct", "relay5", "relay7"].includes(input.egress)) throw new Error("INVALID_ACCOUNT_EGRESS");
+      this.ctx.storage.sql.exec("UPDATE accounts SET egress_type=?,updated_at=? WHERE id=?", input.egress, Date.now(), accountId);
+    }
+    if (input.enabled === false) {
+      const now = Date.now();
+      this.ctx.storage.sql.exec(
+        `INSERT INTO account_health(account_id,state,failure_kind,failure_count,cooldown_until,last_failure_at,updated_at)
+         VALUES(?,'isolated','manual',0,0,0,?) ON CONFLICT(account_id) DO UPDATE SET
+         state='isolated',failure_kind='manual',failure_count=0,cooldown_until=0,last_failure_at=0,updated_at=excluded.updated_at`,
+        accountId,
+        now,
+      );
+      const route = this.ensureActiveAccountRoute();
+      if (route.accountId === accountId) this.advanceActiveAccount(accountId, route.epoch);
+    } else if (input.enabled === true) {
+      await this.reportAccountSuccess(accountId, true);
+      this.ensureActiveAccountRoute();
+    }
+    await this.scheduleNextAlarm();
+    return (await this.listAccounts()).find((account) => account.id === accountId) ?? null;
   }
 
   /**
@@ -1978,6 +2127,37 @@ export class TenantState extends DurableObject<Env> {
     return (await this.listAccounts()).find((account) => account.id === accountId) ?? null;
   }
 
+  /** Obtain a token for an additional Microsoft resource without replacing
+   * the primary Substrate access token. Rotated refresh credentials are
+   * persisted through the same encrypted authoritative store and KV mirror. */
+  async serviceAccessToken(scope: string, id = ""): Promise<{ accountId: string; token: OAuthTokenSet } | null> {
+    const requestedScope = scope.trim();
+    if (!requestedScope || requestedScope.length > 512 || !/^https:\/\/[A-Za-z0-9./:_-]+$/u.test(requestedScope)) {
+      throw new Error("INVALID_SERVICE_SCOPE");
+    }
+    const route = this.ensureActiveAccountRoute();
+    const accountId = id.trim() || route.accountId;
+    if (!accountId) return null;
+    if (accountId !== route.accountId) throw new Error("ACCOUNT_NOT_ACTIVE");
+    const primary = await this.ensureValidAccount(accountId);
+    if (!primary) return null;
+    const cacheKey = `${accountId}\u0000${requestedScope}`;
+    const cached = this.scopedTokenCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now() + ACTIVE_TOKEN_REFRESH_ADVANCE_MS) {
+      return { accountId, token: { ...primary, accessToken: cached.accessToken, expiresAt: cached.expiresAt } };
+    }
+    const scoped = await scopedAccessToken(this.env, primary, requestedScope);
+    if (this.activeAccountRoute().accountId !== accountId) throw new Error("ACCOUNT_NOT_ACTIVE");
+    if (scoped.refreshToken && scoped.refreshToken !== primary.refreshToken) {
+      await this.upsertAccount({ ...primary, refreshToken: scoped.refreshToken }, false);
+    }
+    this.scopedTokenCache.set(cacheKey, scoped);
+    return {
+      accountId,
+      token: { ...primary, accessToken: scoped.accessToken, refreshToken: scoped.refreshToken, expiresAt: scoped.expiresAt },
+    };
+  }
+
   private publicAccount(row: AccountRow): PublicAccount {
     const now = Date.now();
     const active = this.activeAccountRoute().accountId === row.id;
@@ -1986,7 +2166,7 @@ export class TenantState extends DurableObject<Env> {
       : (row.cooldown_until ?? 0) > now
         ? "cooldown"
         : "healthy";
-    const failureKind = ["rate_limit", "transient", "auth", "permanent"].includes(row.failure_kind ?? "")
+    const failureKind = ["rate_limit", "transient", "auth", "permanent", "manual"].includes(row.failure_kind ?? "")
       ? row.failure_kind as PublicAccount["failureKind"]
       : "";
     const refresh = active ? this.activeTokenRefreshSchedule(now) : null;
@@ -2061,7 +2241,12 @@ export class TenantState extends DurableObject<Env> {
   }
 
   async revokeAPIKey(id: string): Promise<boolean> {
-    return this.ctx.storage.sql.exec("UPDATE api_keys SET revoked=1 WHERE id=?", id).rowsWritten > 0;
+    let revoked = false;
+    this.ctx.storage.transactionSync(() => {
+      revoked = this.ctx.storage.sql.exec("UPDATE api_keys SET revoked=1 WHERE id=?", id).rowsWritten > 0;
+      if (revoked) this.ctx.storage.sql.exec("DELETE FROM session_registry WHERE api_key_id=?", id);
+    });
+    return revoked;
   }
 
   async revokeInternalTestAPIKeys(): Promise<number> {
@@ -2077,14 +2262,18 @@ export class TenantState extends DurableObject<Env> {
   }
 
   async validAPIKey(raw: string): Promise<boolean> {
-    if (!raw) return false;
+    return Boolean(await this.authorizeAPIKey(raw));
+  }
+
+  async authorizeAPIKey(raw: string): Promise<APIKeyAuthorization | null> {
+    if (!raw) return null;
     const now = Date.now();
-    const row = this.ctx.storage.sql.exec<{ id: string; last_used_at: number }>(
-      "SELECT id,last_used_at FROM api_keys WHERE key_hash=? AND revoked=0 AND (expires_at=0 OR expires_at>?)",
+    const row = this.ctx.storage.sql.exec<{ id: string; prefix: string; last_used_at: number }>(
+      "SELECT id,prefix,last_used_at FROM api_keys WHERE key_hash=? AND revoked=0 AND (expires_at=0 OR expires_at>?)",
       await sha256(raw),
       now,
     ).toArray()[0];
-    if (!row) return false;
+    if (!row) return null;
     // Persist real last-use data without turning every model request into a
     // SQLite write. The conditional update remains race-safe across requests.
     if (row.last_used_at <= now - API_KEY_LAST_USED_WRITE_INTERVAL_MS) {
@@ -2095,6 +2284,84 @@ export class TenantState extends DurableObject<Env> {
         now - API_KEY_LAST_USED_WRITE_INTERVAL_MS,
       );
     }
-    return true;
+    return { id: row.id, prefix: row.prefix };
+  }
+
+  async registerSession(
+    apiKeyId: string,
+    publicId: string,
+    objectKey: string,
+    endpoint = "chat.completions",
+    model = "",
+    increment = false,
+  ): Promise<void> {
+    const keyId = safeDiagnosticIdentifier(apiKeyId, 128, "");
+    const sessionId = safeDiagnosticIdentifier(publicId, 256, "");
+    const durableKey = safeDiagnosticIdentifier(objectKey, 128, "");
+    const safeEndpoint = safeDiagnosticIdentifier(endpoint, 64, "chat.completions");
+    const safeModel = safeDiagnosticIdentifier(model, 128, "");
+    if (!keyId || !sessionId || !durableKey) throw new Error("INVALID_SESSION_KEY");
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO session_registry(api_key_id,public_id,object_key,endpoint,model,created_at,last_used_at,message_count)
+       VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(api_key_id,public_id) DO UPDATE SET
+       object_key=excluded.object_key,endpoint=excluded.endpoint,
+       model=CASE WHEN excluded.model='' THEN session_registry.model ELSE excluded.model END,
+       last_used_at=excluded.last_used_at,
+       message_count=session_registry.message_count+excluded.message_count`,
+      keyId,
+      sessionId,
+      durableKey,
+      safeEndpoint,
+      safeModel,
+      now,
+      now,
+      increment ? 1 : 0,
+    );
+    this.ctx.storage.sql.exec(
+      `DELETE FROM session_registry WHERE rowid IN (
+       SELECT rowid FROM session_registry WHERE api_key_id=? ORDER BY last_used_at DESC LIMIT -1 OFFSET 512
+       )`,
+      keyId,
+    );
+  }
+
+  async registerSessionForCredential(
+    rawCredential: string,
+    publicId: string,
+    objectKey: string,
+    endpoint: string,
+    model: string,
+  ): Promise<void> {
+    const authorization = await this.authorizeAPIKey(rawCredential);
+    if (!authorization) return;
+    await this.registerSession(authorization.id, publicId, objectKey, endpoint, model, true);
+  }
+
+  async listSessions(apiKeyId: string): Promise<PublicSessionRecord[]> {
+    const keyId = safeDiagnosticIdentifier(apiKeyId, 128, "");
+    if (!keyId) return [];
+    return this.ctx.storage.sql.exec<{
+      public_id: string; endpoint: string; model: string; created_at: number; last_used_at: number; message_count: number;
+    }>(
+      `SELECT public_id,endpoint,model,created_at,last_used_at,message_count
+       FROM session_registry WHERE api_key_id=? ORDER BY last_used_at DESC LIMIT 512`,
+      keyId,
+    ).toArray().map((row) => ({
+      id: row.public_id,
+      endpoint: row.endpoint,
+      model: row.model,
+      createdAt: new Date(row.created_at).toISOString(),
+      lastUsedAt: new Date(row.last_used_at).toISOString(),
+      messageCount: row.message_count,
+    }));
+  }
+
+  async deleteSessionRegistration(apiKeyId: string, publicId: string): Promise<boolean> {
+    return this.ctx.storage.sql.exec(
+      "DELETE FROM session_registry WHERE api_key_id=? AND public_id=?",
+      safeDiagnosticIdentifier(apiKeyId, 128, ""),
+      safeDiagnosticIdentifier(publicId, 256, ""),
+    ).rowsWritten > 0;
   }
 }

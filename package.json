@@ -1,6 +1,6 @@
 {
   "name": "m365-gateway-complete",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Complete Microsoft 365 gateway package for Cloudflare Workers, Node/Docker, and optional fixed-target egress relay deployments",
   "private": true,
   "type": "module",

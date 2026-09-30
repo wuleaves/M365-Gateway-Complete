@@ -27,6 +27,38 @@ function declaredLength(request: Request): number | null {
   return value;
 }
 
+export async function readBytesLimited(request: Request, maxBytes: number): Promise<Uint8Array> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new RangeError("maxBytes must be a non-negative safe integer");
+  const declared = declaredLength(request);
+  if (declared !== null && declared > maxBytes) throw new RequestBodyError("REQUEST_TOO_LARGE");
+  if (!request.body) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel("request body exceeds configured limit").catch(() => undefined);
+        throw new RequestBodyError("REQUEST_TOO_LARGE");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return output;
+}
+
 /**
  * Read a request body without ever buffering more than maxBytes. Cloudflare
  * Workers may receive chunked requests without Content-Length, so checking the

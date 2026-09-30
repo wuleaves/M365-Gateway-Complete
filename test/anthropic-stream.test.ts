@@ -122,10 +122,12 @@ describe("Anthropic streaming compatibility", () => {
     }), env, async (forwarded) => {
       const body = await forwarded.json() as { model: string; reasoning_effort?: string };
       expect(modelTone(body.model, body.reasoning_effort)).toBe(tone);
-      return Response.json({ choices: [{ message: { content: "answer" }, finish_reason: "stop" }] });
+      return Response.json({ choices: [{ message: { reasoning_content: "public summary", content: "answer" }, finish_reason: "stop" }] });
     });
     expect(response.status).toBe(200);
-    expect(await response.text()).not.toContain('"type":"thinking"');
+    const text = await response.text();
+    expect(text).toContain('"type":"thinking"');
+    expect(text).toContain('"thinking":"public summary"');
   });
 
   it("rejects invalid thinking settings before calling the upstream", () => {
@@ -156,6 +158,18 @@ describe("Anthropic streaming compatibility", () => {
     const text = await bodyText(response);
     expect(text).toContain('"text_delta","text":"hello"');
     expect((text.match(/event: message_stop/g) ?? []).length).toBe(1);
+  });
+
+  it("maps streamed public reasoning into Anthropic thinking blocks", async () => {
+    const response = await anthropicRequest(request(), env, async () => upstream(
+      `data: {"choices":[{"delta":{"reasoning_content":"inspect"}}]}\n\n` +
+      `data: {"choices":[{"delta":{"content":"answer"}}]}\n\n` +
+      `data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n`,
+    ));
+    const text = await bodyText(response);
+    expect(text).toContain('"type":"thinking"');
+    expect(text).toContain('"type":"thinking_delta","thinking":"inspect"');
+    expect(text).toContain('"type":"text_delta","text":"answer"');
   });
 
   it("treats [DONE] as terminal and suppresses duplicate terminal frames", async () => {

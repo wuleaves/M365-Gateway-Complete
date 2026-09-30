@@ -1,7 +1,7 @@
 import { anthropicErrorResponse, anthropicRequest } from "./anthropic";
 import { authorizationURL, exchangeCode } from "./oauth";
-import { openAIRequest } from "./openai";
-import { codexModelCatalog, modelCatalog } from "./models";
+import { chatSessionKey, openAIRequest } from "./openai";
+import { applyRuntimeModelConfiguration, codexModelCatalog, modelCatalog } from "./models";
 import {
   ACCOUNT_MIGRATION_PATH,
   MigrationRequestError,
@@ -11,6 +11,15 @@ import { readJSONLimited } from "./request-body";
 import { RequestMetricTracker, shouldRetainRequestObservation, trackBufferedResponse, trackStreamingResponse } from "./request-metrics";
 import { MAX_API_KEY_NAME_CHARACTERS, MAX_API_KEY_VALIDITY_DAYS, TenantState } from "./tenant-state";
 import type { Env, RequestMetricInput } from "./types";
+import type { APIKeyAuthorization } from "./tenant-state";
+import {
+  cleanupCloudConversations,
+  deleteCloudConversation,
+  listCloudConversations,
+  memoryService,
+  pluginService,
+  type MicrosoftServiceResult,
+} from "./m365-services";
 
 
 const SESSION_COOKIE = "m365_admin_session";
@@ -25,11 +34,11 @@ const CAPABILITY_MATRIX = Object.freeze({
   persistentUsageStats: true,
   boundedDiagnostics: true,
   strongAccountSessionCleanup: false,
-  runtimeSettingsWrite: false,
+  runtimeSettingsWrite: true,
   perAccountProxy: false,
   fixedTargetEgressRelay: true,
   arbitraryProxyPool: false,
-  sessionEnumeration: false,
+  sessionEnumeration: true,
   filesystemPaths: false,
   localProcessLaunch: false,
 });
@@ -59,6 +68,40 @@ function json(value: unknown, status = 200, headers?: HeadersInit): Response {
 
 function error(status: number, code: string, message: string): Response {
   return json({ error: { type: "cloudflare_native_error", code, message } }, status, { "X-M365-Error-Code": code });
+}
+
+function apiCredential(request: Request): string {
+  return request.headers.get("X-API-Key")?.trim()
+    || request.headers.get("Authorization")?.replace(/^Bearer\s+/iu, "").trim()
+    || "";
+}
+
+function authorizeAPIKey(request: Request, env: Env): Promise<APIKeyAuthorization | null> {
+  return tenant(env).authorizeAPIKey(apiCredential(request));
+}
+
+function serviceResponse(result: MicrosoftServiceResult): Response {
+  if (result.status < 200 || result.status >= 300) {
+    const status = result.status >= 400 && result.status <= 599 ? result.status : 502;
+    return error(status, "microsoft_service_error", "Microsoft 365 service rejected the request");
+  }
+  return json(result.data, result.status, {
+    "X-M365-Account": result.accountId,
+    ...(result.cache ? { "X-Cache": result.cache } : {}),
+  });
+}
+
+function serviceFailure(cause: unknown): Response {
+  const code = cause instanceof Error ? cause.message : "";
+  if (code === "INVALID_SERVICE_IDENTIFIER") return error(400, "invalid_request_error", "invalid Microsoft 365 resource identifier");
+  if (code === "NO_HEALTHY_ACCOUNT") return error(503, "account_unavailable", "no healthy Microsoft 365 account is available");
+  if (code === "SERVICE_RESPONSE_TOO_LARGE") return error(502, "upstream_payload_too_large", "Microsoft 365 service response exceeded the gateway limit");
+  if (code === "SERVICE_INVALID_RESPONSE") return error(502, "upstream_response_error", "Microsoft 365 service returned invalid JSON");
+  if (code === "MICROSOFT_REFRESH_TOKEN_REJECTED" || code === "MICROSOFT_REFRESH_TOKEN_MISSING") {
+    return error(409, "account_reauthorization_required", "Microsoft 365 authorization must be renewed for this feature");
+  }
+  if (code === "ACCOUNT_NOT_ACTIVE") return error(409, "account_not_active", "only the active Microsoft 365 account can perform this operation");
+  return error(502, "upstream_unavailable", "Microsoft 365 service is temporarily unavailable");
 }
 
 function isJSONObject(value: unknown): value is Record<string, unknown> {
@@ -266,9 +309,38 @@ async function adminRoute(request: Request, env: Env, url: URL): Promise<Respons
       sessionTTL: "24 hours",
       adminSessionTTL: "24 hours",
       chatSessionTTL: "30 days",
+      runtime: await state.runtimeConfiguration(),
       capabilities: CAPABILITY_MATRIX,
     } });
-    return error(501, "not_implemented", "runtime settings editing is not available in the preview build");
+    if (request.method === "PUT" || request.method === "PATCH") {
+      try {
+        const runtime = await state.setRuntimeConfiguration(await jsonBody<unknown>(request));
+        applyRuntimeModelConfiguration(runtime.models);
+        return json({ status: "updated", runtime });
+      } catch {
+        return error(400, "invalid_runtime_configuration", "runtime configuration is outside the supported bounds");
+      }
+    }
+    return error(405, "method_not_allowed", "GET, PUT, or PATCH is required for runtime settings");
+  }
+  if (url.pathname === "/api/admin/models") {
+    if (request.method === "GET") {
+      const runtime = await state.runtimeConfiguration();
+      applyRuntimeModelConfiguration(runtime.models);
+      return json({ runtime: runtime.models, catalog: modelCatalog() });
+    }
+    if (request.method === "PUT") {
+      try {
+        const input = await jsonBody<unknown>(request);
+        const current = await state.runtimeConfiguration();
+        const runtime = await state.setRuntimeConfiguration({ ...current, models: input });
+        applyRuntimeModelConfiguration(runtime.models);
+        return json({ status: "updated", runtime: runtime.models, catalog: modelCatalog() });
+      } catch {
+        return error(400, "invalid_model_configuration", "model aliases or tone definitions are invalid");
+      }
+    }
+    return error(405, "method_not_allowed", "GET or PUT is required for /api/admin/models");
   }
   if (url.pathname === "/api/admin/egress" && request.method === "GET") {
     // Cloudflare Workers cannot safely accept arbitrary HTTP/SOCKS proxy URLs.
@@ -285,6 +357,25 @@ async function adminRoute(request: Request, env: Env, url: URL): Promise<Respons
       relays: [relay("direct", "configured"), relay("relay5", env.RELAY5_URL), relay("relay7", env.RELAY7_URL)],
       note: "Cloudflare-native mode does not support arbitrary HTTP/HTTPS/SOCKS5 proxy URLs.",
     });
+  }
+  if (url.pathname === "/api/admin/egress/check" && (request.method === "GET" || request.method === "POST")) {
+    const check = async (name: "relay5" | "relay7", value?: string): Promise<Record<string, unknown>> => {
+      if (!value?.trim()) return { name, configured: false, healthy: false, status: "not_configured" };
+      const started = Date.now();
+      try {
+        const target = new URL("/health", value);
+        if (target.protocol !== "https:") throw new Error("invalid relay scheme");
+        const response = await fetch(target, { method: "GET", signal: AbortSignal.timeout(5_000) });
+        await response.body?.cancel().catch(() => undefined);
+        return { name, configured: true, healthy: response.ok, status: response.status, latencyMs: Date.now() - started };
+      } catch {
+        return { name, configured: true, healthy: false, status: "unreachable", latencyMs: Date.now() - started };
+      }
+    };
+    return json({ direct: { name: "direct", configured: true, healthy: true }, relays: await Promise.all([
+      check("relay5", env.RELAY5_URL),
+      check("relay7", env.RELAY7_URL),
+    ]) });
   }
   if (url.pathname === "/api/admin/models/discover" && request.method === "GET") {
     // Read-only discovery of public Microsoft UI bundle labels. The result is
@@ -310,6 +401,10 @@ async function adminRoute(request: Request, env: Env, url: URL): Promise<Respons
     const limit = Number.parseInt(url.searchParams.get("limit") ?? "100", 10);
     return json({ records: await state.listDiagnostics(limit), maxRecords: 200 });
   }
+  if (url.pathname === "/api/admin/usage" && request.method === "GET") {
+    const limit = Number.parseInt(url.searchParams.get("limit") ?? "500", 10);
+    return json({ totals: await state.statsSnapshot(), dimensions: await state.usageDimensionStats(limit) });
+  }
   if (url.pathname === "/api/admin/reset-stats" && request.method === "POST") {
     return json({ status: "reset", ...(await state.resetRequestStats()) });
   }
@@ -324,6 +419,49 @@ async function accountRoute(request: Request, env: Env, url: URL): Promise<Respo
   if (url.pathname === "/api/accounts" && request.method === "GET") {
     const snapshot = await state.accountsSnapshot();
     return json({ accounts: snapshot.accounts, ...snapshot.totals, accountLimit: Number(env.MAX_ACCOUNTS) });
+  }
+  if (url.pathname === "/api/accounts/activate" && request.method === "POST") {
+    const body = await jsonBody<{ id?: string }>(request);
+    const activated = await state.activateAccount(body.id ?? "");
+    return activated ? json({ status: "activated", id: body.id }) : error(409, "account_unavailable", "account is missing, disabled, or cooling down");
+  }
+  if (url.pathname === "/api/accounts/configure" && request.method === "POST") {
+    const body = await jsonBody<{ id?: string; enabled?: boolean; egress?: "direct" | "relay5" | "relay7" }>(request);
+    if (body.enabled !== undefined && typeof body.enabled !== "boolean") return error(400, "invalid_account_setting", "enabled must be a boolean");
+    if (body.egress !== undefined && !["direct", "relay5", "relay7"].includes(body.egress)) return error(400, "invalid_account_egress", "egress must be direct, relay5, or relay7");
+    const account = await state.configureAccount(body.id ?? "", { enabled: body.enabled, egress: body.egress });
+    return account ? json({ status: "updated", account }) : error(404, "account_not_found", "account not found");
+  }
+  if (url.pathname === "/api/accounts/token-health" && request.method === "POST") {
+    const body = await jsonBody<{ id?: string; refresh?: boolean }>(request);
+    try {
+      const token = await state.ensureValidAccount(body.id ?? "", body.refresh === true);
+      if (!token) return error(404, "account_not_found", "account not found");
+      return json({ status: "valid", expiresAt: new Date(token.expiresAt).toISOString(), identityComplete: Boolean(token.oid && token.tid) });
+    } catch (cause) {
+      return serviceFailure(cause);
+    }
+  }
+  if (url.pathname === "/api/accounts/clear-cooldown" && request.method === "POST") {
+    const body = await jsonBody<{ id?: string }>(request);
+    const account = await state.configureAccount(body.id ?? "", { enabled: true });
+    return account ? json({ status: "healthy", account }) : error(404, "account_not_found", "account not found");
+  }
+  if (url.pathname === "/api/accounts/batch" && request.method === "POST") {
+    const body = await jsonBody<{ ids?: unknown; enabled?: boolean; egress?: "direct" | "relay5" | "relay7" }>(request);
+    if (!Array.isArray(body.ids) || body.ids.length === 0 || body.ids.length > 50 || body.ids.some((id) => typeof id !== "string")) {
+      return error(400, "invalid_account_batch", "ids must contain 1 to 50 account ids");
+    }
+    if (body.enabled !== undefined && typeof body.enabled !== "boolean") return error(400, "invalid_account_setting", "enabled must be a boolean");
+    if (body.egress !== undefined && !["direct", "relay5", "relay7"].includes(body.egress)) return error(400, "invalid_account_egress", "egress must be direct, relay5, or relay7");
+    const updated = [];
+    const missing: string[] = [];
+    for (const id of body.ids as string[]) {
+      const account = await state.configureAccount(id, { enabled: body.enabled, egress: body.egress });
+      if (account) updated.push(account);
+      else missing.push(id.slice(0, 128));
+    }
+    return json({ status: "updated", accounts: updated, missing });
   }
   if (url.pathname === "/api/accounts/delete" && request.method === "POST") {
     const body = await jsonBody<{ id?: string }>(request);
@@ -435,19 +573,164 @@ async function migrationRoute(request: Request, env: Env): Promise<Response> {
   }
 }
 
+async function serviceRoute(request: Request, env: Env, url: URL): Promise<Response> {
+  try {
+    if (url.pathname === "/api/plugins") {
+      if (request.method !== "GET") return error(405, "method_not_allowed", "GET is required for /api/plugins");
+      if (!(await authorizeAPIKey(request, env))) return error(401, "auth_error", "valid API key required");
+      return serviceResponse(await pluginService(env));
+    }
+
+    if (url.pathname === "/api/conversations" && request.method === "GET") {
+      const access = await admin(request, env);
+      if (!access.ok) return access.response;
+      return serviceResponse(await listCloudConversations(env));
+    }
+    if (url.pathname === "/api/conversations/delete" && request.method === "POST") {
+      const access = await admin(request, env);
+      if (!access.ok) return access.response;
+      const input = await jsonBody<{ conversation_id?: string }>(request);
+      return serviceResponse(await deleteCloudConversation(env, input.conversation_id ?? ""));
+    }
+    if (url.pathname === "/api/conversations/cleanup" && request.method === "POST") {
+      const access = await admin(request, env);
+      if (!access.ok) return access.response;
+      const input = await jsonBody<{ max_age_days?: number; keep_latest?: number }>(request);
+      const maxAgeDays = Number.isFinite(input.max_age_days) ? Math.max(0, Math.min(3_650, Math.trunc(input.max_age_days!))) : 30;
+      const keepLatest = Number.isFinite(input.keep_latest) ? Math.max(0, Math.min(500, Math.trunc(input.keep_latest!))) : 20;
+      return json(await cleanupCloudConversations(env, maxAgeDays, keepLatest));
+    }
+
+    if (url.pathname.startsWith("/v1/memory/")) {
+      const write = request.method !== "GET";
+      if (write) {
+        const access = await admin(request, env);
+        if (!access.ok) return access.response;
+      } else if (!(await authorizeAPIKey(request, env))) {
+        return error(401, "auth_error", "valid API key required");
+      }
+      if (url.pathname === "/v1/memory/flags" && request.method === "GET") {
+        return serviceResponse(await memoryService(env, "flags", "GET"));
+      }
+      if (url.pathname === "/v1/memory/flags" && request.method === "PATCH") {
+        return serviceResponse(await memoryService(env, "flags", "POST", await jsonBody<unknown>(request)));
+      }
+      if (url.pathname === "/v1/memory/instructions" && request.method === "GET") {
+        return serviceResponse(await memoryService(env, "instructions", "GET"));
+      }
+      if (url.pathname === "/v1/memory/instructions" && request.method === "PUT") {
+        return serviceResponse(await memoryService(env, "instructions", "POST", await jsonBody<unknown>(request)));
+      }
+      if (url.pathname === "/v1/memory/settings" && request.method === "PATCH") {
+        return serviceResponse(await memoryService(env, "settings", "PATCH", await jsonBody<unknown>(request)));
+      }
+      const prefix = "/v1/memory/instructions/";
+      if (url.pathname.startsWith(prefix) && request.method === "DELETE") {
+        return serviceResponse(await memoryService(env, "instruction", "DELETE", undefined, decodeURIComponent(url.pathname.slice(prefix.length))));
+      }
+      return error(405, "method_not_allowed", "memory resource does not support this method");
+    }
+    return error(404, "not_found", "service endpoint not found");
+  } catch (cause) {
+    return serviceFailure(cause);
+  }
+}
+
+function mcpTools(): Record<string, unknown>[] {
+  return [
+    { name: "m365_memory_flags", description: "Read Microsoft 365 personalization flags", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
+    { name: "m365_memory_instructions", description: "Read Microsoft 365 custom instructions", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
+    { name: "m365_plugins", description: "List Microsoft 365 action plugins", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
+  ];
+}
+
+async function mcpRoute(request: Request, env: Env, url: URL): Promise<Response> {
+  if (!(await authorizeAPIKey(request, env))) return error(401, "auth_error", "valid API key required");
+  if (url.pathname === "/v1/mcp/tools" && request.method === "GET") return json({ tools: mcpTools() });
+  if (url.pathname === "/v1/mcp/sse" && request.method === "GET") {
+    return new Response(`event: endpoint\ndata: /v1/mcp/message\n\nevent: tools\ndata: ${JSON.stringify({ tools: mcpTools() })}\n\n`, {
+      headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-store" },
+    });
+  }
+  if (url.pathname !== "/v1/mcp/message" || request.method !== "POST") {
+    return error(405, "method_not_allowed", "unsupported MCP method");
+  }
+  const input = await jsonBody<{ jsonrpc?: unknown; id?: unknown; method?: unknown; params?: unknown }>(request);
+  const id = input.id ?? null;
+  const method = typeof input.method === "string" ? input.method : "";
+  const success = (result: unknown): Response => json({ jsonrpc: "2.0", id, result });
+  const failure = (code: number, message: string): Response => json({ jsonrpc: "2.0", id, error: { code, message } });
+  if (method === "initialize") return success({ protocolVersion: "2025-06-18", capabilities: { tools: { listChanged: false } }, serverInfo: { name: "m365-gateway-complete", version: "0.2.0" } });
+  if (method === "ping") return success({});
+  if (method === "tools/list") return success({ tools: mcpTools() });
+  if (method === "tools/call") {
+    const params = isJSONObject(input.params) ? input.params : {};
+    const name = typeof params.name === "string" ? params.name : "";
+    try {
+      const result = name === "m365_plugins"
+        ? await pluginService(env)
+        : name === "m365_memory_flags"
+          ? await memoryService(env, "flags", "GET")
+          : name === "m365_memory_instructions"
+            ? await memoryService(env, "instructions", "GET")
+            : null;
+      if (!result) return failure(-32602, "unknown tool");
+      if (result.status < 200 || result.status >= 300) return success({ isError: true, content: [{ type: "text", text: "Microsoft 365 rejected the tool request" }] });
+      return success({ content: [{ type: "text", text: JSON.stringify(result.data) }] });
+    } catch {
+      return success({ isError: true, content: [{ type: "text", text: "Microsoft 365 tool is temporarily unavailable" }] });
+    }
+  }
+  return failure(-32601, "method not found");
+}
+
+async function sessionRoute(request: Request, env: Env, url: URL): Promise<Response> {
+  const authorization = await authorizeAPIKey(request, env);
+  if (!authorization) return error(401, "auth_error", "valid API key required");
+  const state = tenant(env);
+  if (url.pathname === "/v1/sessions" && request.method === "GET") {
+    return json({ object: "list", data: await state.listSessions(authorization.id) });
+  }
+  if (url.pathname === "/v1/sessions" && request.method === "POST") {
+    const input = await jsonBody<{ id?: string; model?: string; endpoint?: string }>(request);
+    const id = input.id?.trim() || crypto.randomUUID();
+    if (id.length > 256 || !/^[A-Za-z0-9_.:@-]+$/u.test(id)) return error(400, "invalid_session_key", "session id contains unsupported characters");
+    const objectKey = await chatSessionKey(request, { session_key: id });
+    await state.registerSession(authorization.id, id, objectKey, input.endpoint ?? "chat.completions", input.model ?? "");
+    const snapshot = await env.CHATS.getByName(objectKey).inspect();
+    return json({ id, object: "session", ...snapshot }, 201);
+  }
+  const prefix = "/v1/sessions/";
+  if (!url.pathname.startsWith(prefix)) return error(404, "not_found", "session endpoint not found");
+  const id = decodeURIComponent(url.pathname.slice(prefix.length)).trim();
+  if (!id || id.length > 256 || !/^[A-Za-z0-9_.:@-]+$/u.test(id)) return error(400, "invalid_session_key", "invalid session id");
+  const objectKey = await chatSessionKey(request, { session_key: id });
+  const stub = env.CHATS.getByName(objectKey);
+  if (request.method === "GET") return json({ id, object: "session", ...(await stub.inspect()) });
+  if (request.method === "DELETE") {
+    const result = await stub.reset();
+    if (result === "busy") return error(409, "conversation_busy", "session currently has an active request");
+    await state.deleteSessionRegistration(authorization.id, id);
+    return json({ id, deleted: true, status: result });
+  }
+  return error(405, "method_not_allowed", "unsupported session method");
+}
+
 async function openAI(
   request: Request,
   env: Env,
   url: URL,
   metrics: RequestMetricTracker,
 ): Promise<Response> {
-  const raw = request.headers.get("X-API-Key")?.trim()
-    || request.headers.get("Authorization")?.replace(/^Bearer\s+/iu, "").trim()
-    || "";
-  if (!(await tenant(env).validAPIKey(raw))) {
+  const authorization = await authorizeAPIKey(request, env);
+  if (!authorization) {
     if (url.pathname === "/v1/messages") return anthropicErrorResponse(401, "authentication_error", "valid API key required");
     return error(401, "auth_error", "valid API key required");
   }
+  metrics?.setAPIKeyId(authorization.id);
+  metrics?.setEndpoint(url.pathname.replace(/^\/v1\//u, "").replaceAll("/", "."));
+  const runtime = await tenant(env).runtimeConfiguration();
+  applyRuntimeModelConfiguration(runtime.models);
   if (url.pathname === "/v1/models" && request.method === "GET") {
     if (url.searchParams.has("client_version")) {
       return json(codexModelCatalog(url.searchParams.get("client_version") ?? ""));
@@ -481,7 +764,11 @@ export default {
     // catalog read into TenantState metrics.  Authentication failures and
     // method errors still use the normal diagnostic path below.
     const catalogRead = url.pathname === "/v1/models" && request.method === "GET";
-    const metrics = url.pathname.startsWith("/v1/") && !catalogRead ? new RequestMetricTracker({
+    const inferenceRequest = [
+      "/v1/chat/completions", "/v1/responses", "/v1/responses/compact", "/v1/messages",
+      "/v1/images/generations", "/v1/images/edits", "/v1/images/variations",
+    ].includes(url.pathname);
+    const metrics = inferenceRequest && !catalogRead ? new RequestMetricTracker({
       requestId,
       startedAt,
       sink: {
@@ -583,7 +870,11 @@ export default {
       else if (url.pathname.startsWith("/api/admin/")) response = await adminRoute(request, env, url);
       else if (url.pathname.startsWith("/api/accounts")) response = await accountRoute(request, env, url);
       else if (url.pathname.startsWith("/api/auth/")) response = await oauthRoute(request, env, url);
+      else if (url.pathname === "/api/plugins" || url.pathname.startsWith("/api/conversations")) response = await serviceRoute(request, env, url);
       else if (url.pathname.startsWith("/api/")) response = error(404, "not_found", "API endpoint not found");
+      else if (url.pathname.startsWith("/v1/memory/")) response = await serviceRoute(request, env, url);
+      else if (url.pathname.startsWith("/v1/mcp/")) response = await mcpRoute(request, env, url);
+      else if (url.pathname === "/v1/sessions" || url.pathname.startsWith("/v1/sessions/")) response = await sessionRoute(request, env, url);
       else if (url.pathname.startsWith("/v1/")) response = await openAI(request, env, url, metrics!);
       else if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html" || url.pathname === "/login" || url.pathname === "/login.html")) response = await managementPage(request, env, url);
       else response = await env.ASSETS.fetch(request);

@@ -14,7 +14,7 @@ function metricFixture() {
 }
 
 const multimodalCodes: MultimodalInputErrorCode[] = [
-  "audio_not_supported", "image_too_large", "invalid_image",
+  "audio_too_large", "file_too_large", "image_too_large", "invalid_audio", "invalid_file", "invalid_image",
   "invalid_multimodal_content", "too_many_images", "unsupported_content_part",
 ];
 

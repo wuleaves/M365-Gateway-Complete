@@ -34,13 +34,13 @@ import { validateToolArguments } from "./tool-schema";
 import { appendPublicReasoning, publicReasoningEvents, requestsPublicReasoning } from "./public-reasoning";
 import { CitationMarkerStreamFilter, stripInternalCitationMarkers } from "./public-citations";
 import { createUpstreamGateLifecycle, type UpstreamGateLifecycle } from "./upstream-lifecycle";
-import { MAX_AI_REQUEST_BYTES, MAX_RESPONSES_REQUEST_BYTES, readJSONLimited } from "./request-body";
+import { MAX_AI_REQUEST_BYTES, MAX_RESPONSES_REQUEST_BYTES, readBytesLimited, readJSONLimited } from "./request-body";
 import type { RequestMetricTracker } from "./request-metrics";
 import {
   MultimodalInputError,
   normalizeMultimodalContent,
   normalizeMultimodalContents,
-  type NormalizedImageAttachment,
+  type NormalizedMediaAttachment,
   type NormalizedMultimodalContent,
 } from "./multimodal";
 import {
@@ -1374,8 +1374,11 @@ async function guardedFunctionCall(
 const LEGACY_TOOL_RECOVERY_TERMINATION_PREFIX = "Tool execution stopped after a repeated or invalid action.";
 
 const MULTIMODAL_INPUT_ERRORS: Record<MultimodalInputError["code"], { status: number; message: string }> = {
-  audio_not_supported: { status: 400, message: "audio input is not supported by this endpoint" },
+  audio_too_large: { status: 413, message: "audio input exceeds the per-item or aggregate request limit" },
+  file_too_large: { status: 413, message: "file input exceeds the per-item or aggregate request limit" },
   image_too_large: { status: 413, message: "image input exceeds the per-image or aggregate request limit" },
+  invalid_audio: { status: 400, message: "audio input must be a safe HTTPS URL or a supported data URI" },
+  invalid_file: { status: 400, message: "file input must be a safe HTTPS URL or a supported data URI" },
   invalid_image: { status: 400, message: "image input must be a safe HTTPS URL or a supported raster data URI" },
   invalid_multimodal_content: { status: 400, message: "multimodal content is malformed or uses an image in an unsupported role" },
   too_many_images: { status: 400, message: "a request may contain at most 8 images" },
@@ -1459,6 +1462,7 @@ export function publicFailure(cause: unknown): { code: string; message: string }
   if (raw.startsWith("RELAY_DIAL_FAILED:") || raw === "RELAY_DIAL_ERROR") return { code: "upstream_relay_error", message: "the configured egress relay could not connect to Microsoft ChatHub" };
   if (raw.startsWith("WS_HANDSHAKE_")) return { code: "upstream_connect_error", message: "Microsoft ChatHub rejected or returned an invalid realtime handshake" };
   if (raw.startsWith("WS_CLOSED_BEFORE_COMPLETION") || raw.startsWith("CHAT_CLOSED_BEFORE_COMPLETION") || raw === "WS_ERROR_BEFORE_COMPLETION") return { code: "upstream_disconnected", message: "Microsoft ChatHub disconnected before completion" };
+  if (raw === "CHAT_FIRST_OUTPUT_TIMEOUT") return { code: "upstream_first_output_timeout", message: "Microsoft ChatHub produced no model output before the first-output deadline" };
   if (raw === "WS_READ_TIMEOUT" || raw === "CHAT_DEADLINE_EXCEEDED" || raw === "CHAT_PROGRESS_TIMEOUT") return { code: "upstream_timeout", message: "Microsoft ChatHub timed out before completion" };
   if (["WS_FRAME_TOO_LARGE", "WS_BUFFER_TOO_LARGE", "WS_FRAME_TOO_MANY_RECORDS", "CHAT_OUTPUT_TOO_LARGE", "CHAT_IMAGE_OUTPUT_TOO_LARGE"].includes(raw)) return { code: "upstream_payload_too_large", message: "Microsoft ChatHub exceeded the gateway's bounded frame or output limit" };
   if (raw === "INVALID_CHAT_HUB_ATTACHMENTS") return { code: "invalid_upstream_attachment", message: "the normalized image attachment could not be encoded for Microsoft ChatHub" };
@@ -1515,6 +1519,7 @@ export function escapePromptProtocolText(value: string): string {
 }
 
 const IMAGE_CONTEXT_PLACEHOLDER = "[IMAGE ATTACHMENTS PRESENT]";
+const MEDIA_CONTEXT_PLACEHOLDER = "[MEDIA ATTACHMENTS PRESENT]";
 
 export interface PreparedMultimodalInput<T> {
   /** Text-only value used for the live invocation. Image bytes travel through
@@ -1523,13 +1528,16 @@ export interface PreparedMultimodalInput<T> {
   inferenceValue: T;
   /** Redacted value suitable for ledgers and durable continuation state. */
   value: T;
-  attachments: NormalizedImageAttachment[];
+  attachments: NormalizedMediaAttachment[];
 }
 
 function persistentContent(normalized: NormalizedMultimodalContent): string {
   const parts = [normalized.text.trim()];
   if (normalized.attachments.length > 0) {
-    parts.push(`${IMAGE_CONTEXT_PLACEHOLDER} (${normalized.attachments.length})`);
+    const placeholder = normalized.attachments.every((attachment) => attachment.type === "image")
+      ? IMAGE_CONTEXT_PLACEHOLDER
+      : MEDIA_CONTEXT_PLACEHOLDER;
+    parts.push(`${placeholder} (${normalized.attachments.length})`);
   }
   return parts.filter(Boolean).join("\n");
 }
@@ -1579,7 +1587,7 @@ export function prepareResponsesMultimodal(input: unknown): PreparedMultimodalIn
       targets.push({ index, field: "output", role: "tool", value: item.output ?? "" });
     } else if (type === "message" || role) {
       targets.push({ index, field: "content", role: role || "user", value: item.content ?? "" });
-    } else if (["image", "image_url", "input_image", "input_text", "text"].includes(type)) {
+    } else if (["image", "image_url", "input_image", "file", "input_file", "audio", "input_audio", "input_text", "text"].includes(type)) {
       targets.push({ index, field: "part", role: "user", value: [item] });
     }
   }
@@ -2698,8 +2706,12 @@ function optionalSessionIdentifier(value: unknown, strict = true): string {
 function stableSessionCandidate(request: Request, bodyValue: { session_key?: unknown; conversation_id?: unknown }): string {
   const sessionKey = optionalSessionIdentifier(bodyValue.session_key);
   const conversationId = optionalSessionIdentifier(bodyValue.conversation_id);
+  const m365HeaderKey = optionalSessionIdentifier(request.headers.get("X-M365-Session-Id"));
   const headerKey = optionalSessionIdentifier(request.headers.get("X-Session-Key"));
-  return sessionKey || conversationId || headerKey;
+  // Match the maintained gateway's explicit-session contract while retaining
+  // the earlier CF aliases. The M365 header is intentionally authoritative:
+  // compatibility clients frequently also synthesize a body conversation id.
+  return m365HeaderKey || sessionKey || conversationId || headerKey;
 }
 
 function apiCredential(request: Request): string {
@@ -2906,7 +2918,7 @@ async function exchange(
   tone: string,
   tools: unknown[] | undefined,
   toolChoice: unknown,
-  attachments: ReadonlyArray<NormalizedImageAttachment> | undefined,
+  attachments: ReadonlyArray<NormalizedMediaAttachment> | undefined,
   emit?: (delta: string) => void,
   signal?: AbortSignal,
   gateLifecycle?: UpstreamGateLifecycle,
@@ -2916,6 +2928,7 @@ async function exchange(
 ): Promise<ChatHubResult> {
   const logicalDeadline = deadlineAt ?? logicalRequestDeadlineAt();
   const state = env.TENANTS.getByName(env.TENANT_NAME || "default");
+  const firstOutputTimeoutMs = (await state.runtimeConfiguration()).firstOutputTimeoutMs;
   let token = account.token;
   let activePrompt = prompt;
   let accountRouteRetryUsed = false;
@@ -2974,6 +2987,7 @@ async function exchange(
           toolChoice,
           signal,
           deadlineAt: logicalDeadline,
+          firstOutputTimeoutMs,
         }, accountChatHubRelay(env, account.egress), runId);
         upstreamCompleted = true;
       } finally {
@@ -3813,6 +3827,7 @@ async function routerExchange(
   nativeToolChoice: unknown = "none",
 ): Promise<ChatHubResult> {
   const state = env.TENANTS.getByName(env.TENANT_NAME || "default");
+  const firstOutputTimeoutMs = (await state.runtimeConfiguration()).firstOutputTimeoutMs;
   let gate: { accountId: string; leaseId: string } | undefined;
   let lifecycleStarted = false;
   try {
@@ -3836,6 +3851,7 @@ async function routerExchange(
       ...(nativeTools?.length ? { messageProfile: "router" as const } : {}),
       signal,
       deadlineAt,
+      firstOutputTimeoutMs,
     }, accountChatHubRelay(env, account.egress));
     // As in the normal exchange, only ChatHub's structured empty-quota error
     // is a rate-limit failure. A complete router envelope with CostQuota=0 is
@@ -4902,7 +4918,7 @@ async function resolveAssistantTurn(
   tone: string,
   tools: unknown[] | undefined,
   toolChoice: unknown,
-  attachments: ReadonlyArray<NormalizedImageAttachment>,
+  attachments: ReadonlyArray<NormalizedMediaAttachment>,
   ledger: ToolLedger,
   completionLedger: ToolLedger,
   emit: ((delta: string) => void) | undefined,
@@ -6024,7 +6040,7 @@ function chatStream(
   tone: string,
   tools: unknown[] | undefined,
   toolChoice: unknown,
-  attachments: ReadonlyArray<NormalizedImageAttachment>,
+  attachments: ReadonlyArray<NormalizedMediaAttachment>,
   ledger: ToolLedger,
   completionLedger: ToolLedger,
   accountRouteRecoveryPrompt: string,
@@ -6169,8 +6185,15 @@ async function chatCompletions(request: Request, env: Env, metrics?: RequestMetr
   // child is rejected instead of silently reaching the upstream router.
   validateToolChoice(parsed.tool_choice, parsed.tools);
   const model = canonicalModel(parsed.model);
+  metrics?.setModel(model);
   const tone = modelTone(model, parsed.reasoning_effort ?? "");
-  const session = chatSession(env, await chatSessionKey(request, parsed));
+  const sessionKey = await chatSessionKey(request, parsed);
+  const explicitSession = stableSessionCandidate(request, parsed);
+  if (/^[A-Za-z0-9_.:@-]{1,256}$/u.test(explicitSession)) {
+    await env.TENANTS.getByName(env.TENANT_NAME || "default")
+      .registerSessionForCredential(apiCredential(request), explicitSession, sessionKey, "chat.completions", model);
+  }
+  const session = chatSession(env, sessionKey);
   const lease = await acquireConversationLease(env, session, deadlineAt, request.signal);
   const chatToolsSnapshot = callerToolsSnapshot(parsed.tools);
   if (chatToolsSnapshot && typeof (session as unknown as { rememberCallerTools?: unknown }).rememberCallerTools === "function") {
@@ -6182,7 +6205,7 @@ async function chatCompletions(request: Request, env: Env, metrics?: RequestMetr
   let completionLedger: ToolLedger;
   let prompt: string;
   let currentTurnPrompt: string;
-  let attachments: NormalizedImageAttachment[] = [];
+  let attachments: NormalizedMediaAttachment[] = [];
   let promptLimit = 0;
   let promptTokenLimit = 0;
   let recoveredRepeatedProposal = false;
@@ -7106,7 +7129,7 @@ function responsesStream(
   responseSessionKey: string,
   tools: unknown[] | undefined,
   toolChoice: unknown,
-  attachments: ReadonlyArray<NormalizedImageAttachment>,
+  attachments: ReadonlyArray<NormalizedMediaAttachment>,
   ledger: ToolLedger,
   accountRouteRecoveryPrompt: string,
   deadlineAt: number,
@@ -7338,6 +7361,7 @@ async function responsesCore(
   validateTools(parsed.tools);
   parsed.tool_choice = normalizeResponsesCustomToolChoice(parsed.tool_choice);
   const model = canonicalModel(parsed.model);
+  metrics?.setModel(model);
   if (streamLifecycle) {
     streamLifecycle.model = model;
     streamLifecycle.metadata = parsed.metadata;
@@ -7352,6 +7376,11 @@ async function responsesCore(
   const encryptionKeys = compactionEncryptionKeys(env);
   const compactedSession = await compactSessionState(request, parsed.input, encryptionKeys);
   const key = compactedSession?.sessionKey ?? await responsesSessionKey(request, parsed, encryptionKeys);
+  const explicitSession = stableSessionCandidate(request, parsed);
+  if (/^[A-Za-z0-9_.:@-]{1,256}$/u.test(explicitSession)) {
+    await env.TENANTS.getByName(env.TENANT_NAME || "default")
+      .registerSessionForCredential(apiCredential(request), explicitSession, key, "responses", model);
+  }
   const responseSessionKey = await scopedOpaqueKey(request, `m365-response-id-${CLIENT_TOOL_PROTOCOL_GENERATION}`, responseId);
   const sourceSession = chatSession(env, key);
   let session: DurableObjectStub<ChatSession> = sourceSession;
@@ -7426,7 +7455,7 @@ async function responsesCore(
   let ledger: ToolLedger;
   let prompt: string;
   let currentTurnPrompt: string;
-  let attachments: NormalizedImageAttachment[] = [];
+  let attachments: NormalizedMediaAttachment[] = [];
   let promptLimit = 0;
   let promptTokenLimit = 0;
   let recoveredRepeatedProposal = false;
@@ -7766,6 +7795,113 @@ async function responses(request: Request, env: Env, metrics?: RequestMetricTrac
   return quick.response;
 }
 
+function binaryBase64(bytes: Uint8Array): string {
+  const chunks: string[] = [];
+  for (let offset = 0; offset < bytes.length; offset += 32_768) {
+    chunks.push(String.fromCharCode(...bytes.subarray(offset, Math.min(bytes.length, offset + 32_768))));
+  }
+  return btoa(chunks.join(""));
+}
+
+function boundedImageCount(value: unknown): number {
+  const count = typeof value === "string" ? Number(value) : value === undefined ? 1 : Number(value);
+  if (!Number.isInteger(count) || count < 1 || count > 4) throw new Error("INVALID_IMAGE_REQUEST");
+  return count;
+}
+
+function boundedImagePrompt(value: unknown, fallback = "Create a visually distinct variation of the supplied image."): string {
+  const prompt = typeof value === "string" ? value.trim() : "";
+  const selected = prompt || fallback;
+  if (!selected || selected.length > 16_384) throw new Error("INVALID_IMAGE_REQUEST");
+  return selected;
+}
+
+function generatedImageURLs(value: unknown): string[] {
+  if (typeof value !== "string") return [];
+  const output: string[] = [];
+  const seen = new Set<string>();
+  for (const match of value.matchAll(/!\[[^\]]*\]\((data:image\/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]+|https:\/\/[^)\s]+)\)/gu)) {
+    const candidate = match[1];
+    if (!seen.has(candidate)) {
+      seen.add(candidate);
+      output.push(candidate);
+    }
+    if (output.length >= 4) break;
+  }
+  return output;
+}
+
+async function imageForm(request: Request): Promise<FormData> {
+  const bytes = await readBytesLimited(request, MAX_AI_REQUEST_BYTES);
+  const headers = new Headers();
+  const contentType = request.headers.get("Content-Type");
+  if (contentType) headers.set("Content-Type", contentType);
+  try {
+    return await new Request("https://image-form.invalid", { method: "POST", headers, body: bytes }).formData();
+  } catch {
+    throw new Error("INVALID_IMAGE_REQUEST");
+  }
+}
+
+async function imageGeneration(
+  request: Request,
+  env: Env,
+  url: URL,
+  metrics?: RequestMetricTracker,
+): Promise<Response> {
+  let prompt: string;
+  let count: number;
+  let responseFormat = "url";
+  let content: unknown;
+  if (url.pathname === "/v1/images/generations") {
+    const input = await body<{ prompt?: unknown; n?: unknown; response_format?: unknown }>(request);
+    prompt = boundedImagePrompt(input.prompt, "");
+    count = boundedImageCount(input.n);
+    responseFormat = typeof input.response_format === "string" ? input.response_format : "url";
+    content = `${prompt}\n\nGenerate exactly ${count} image${count === 1 ? "" : "s"}.`;
+  } else {
+    const form = await imageForm(request);
+    prompt = boundedImagePrompt(form.get("prompt"));
+    count = boundedImageCount(form.get("n") ?? 1);
+    responseFormat = typeof form.get("response_format") === "string" ? String(form.get("response_format")) : "url";
+    const parts: Record<string, unknown>[] = [{ type: "text", text: `${prompt}\n\nReturn exactly ${count} image${count === 1 ? "" : "s"}.` }];
+    const images = [...form.getAll("image"), ...form.getAll("mask")].slice(0, 4);
+    if (images.length === 0) throw new Error("INVALID_IMAGE_REQUEST");
+    for (const image of images) {
+      if (!(image instanceof Blob) || image.size <= 0 || image.size > 4 * 1024 * 1024 || !["image/png", "image/jpeg", "image/webp", "image/gif"].includes(image.type)) {
+        throw new Error("INVALID_IMAGE_REQUEST");
+      }
+      const encoded = binaryBase64(new Uint8Array(await image.arrayBuffer()));
+      parts.push({ type: "image_url", image_url: { url: `data:${image.type};base64,${encoded}` } });
+    }
+    content = parts;
+  }
+  if (!["url", "b64_json"].includes(responseFormat)) throw new Error("INVALID_IMAGE_REQUEST");
+  const synthetic = new Request(new URL("/v1/chat/completions", request.url), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-M365-Session-Id": `image-${crypto.randomUUID()}` },
+    body: JSON.stringify({ model: "m365-image", messages: [{ role: "user", content }], stream: false }),
+    signal: request.signal,
+  });
+  const completion = await chatCompletions(synthetic, env, metrics);
+  if (!completion.ok) return completion;
+  const payload = await completion.json<unknown>();
+  const choices = payload && typeof payload === "object" && !Array.isArray(payload)
+    ? (payload as { choices?: unknown }).choices
+    : undefined;
+  const message = Array.isArray(choices) && choices[0] && typeof choices[0] === "object"
+    ? (choices[0] as { message?: { content?: unknown } }).message
+    : undefined;
+  const images = generatedImageURLs(message?.content).slice(0, count);
+  if (images.length === 0) return apiError(502, "image_generation_failed", "Microsoft 365 returned no generated image");
+  const data = images.map((image) => {
+    if (responseFormat === "url") return { url: image, revised_prompt: prompt };
+    if (!image.startsWith("data:image/") || !image.includes(";base64,")) throw new Error("IMAGE_B64_UNAVAILABLE");
+    return { b64_json: image.slice(image.indexOf(",") + 1), revised_prompt: prompt };
+  });
+  return Response.json({ created: Math.floor(Date.now() / 1_000), data });
+}
+
 export async function openAIRequest(
   request: Request,
   env: Env,
@@ -7777,7 +7913,8 @@ export async function openAIRequest(
     if (url.pathname === "/v1/responses" && request.method === "POST") return await responses(request, env, metrics);
     if (url.pathname === "/v1/responses/compact" && request.method === "POST") return await responsesCompact(request, env);
     if (["/v1/images/generations", "/v1/images/edits", "/v1/images/variations"].includes(url.pathname)) {
-      return apiError(501, "image_generation_not_supported", "server-side image generation is not supported");
+      if (request.method !== "POST") return apiError(405, "method_not_allowed", `POST is required for ${url.pathname}`);
+      return await imageGeneration(request, env, url, metrics);
     }
     if (["/v1/chat/completions", "/v1/responses", "/v1/responses/compact"].includes(url.pathname)) {
       return apiError(405, "method_not_allowed", `POST is required for ${url.pathname}`);
@@ -7793,6 +7930,8 @@ export async function openAIRequest(
     }
     const code = cause instanceof Error ? cause.message : "REQUEST_FAILED";
     if (code === "EMPTY_PROMPT") return apiError(400, "invalid_request_error", "a non-empty prompt is required");
+    if (code === "INVALID_IMAGE_REQUEST") return apiError(400, "invalid_image_request", "image request fields or multipart image data are invalid");
+    if (code === "IMAGE_B64_UNAVAILABLE") return apiError(400, "image_response_format_unsupported", "b64_json is available only when Microsoft 365 returns an inline image");
     if (code === "INVALID_JSON") return apiError(400, "invalid_json", "request body must be valid JSON");
     if (code === "INVALID_REQUEST" || code === "INVALID_INSTRUCTIONS") return apiError(400, "invalid_request_error", "request body does not match the selected endpoint");
     if (code === "INVALID_TOOLS") return apiError(400, "invalid_tools", "tools must be an array containing at most 128 definitions");

@@ -4,7 +4,7 @@ import type { OAuthTokenSet } from "./types";
 import {
   extractUpstreamImageURLs,
   normalizeMultimodalContent,
-  type NormalizedImageAttachment,
+  type NormalizedMediaAttachment,
 } from "./multimodal";
 import { validateToolArguments } from "./tool-schema";
 
@@ -99,6 +99,7 @@ export function assertBoundedPayload(
 // turns that keep reporting progress, but a completely idle invocation must
 // fail much sooner so Codex can surface/retry it instead of appearing frozen.
 const CHAT_PROGRESS_IDLE_TIMEOUT_MS = 90_000;
+const CHAT_FIRST_OUTPUT_TIMEOUT_MS = 75_000;
 // Handshake is a transport preflight, not model generation. Keep it short so
 // a dead/incorrect ChatHub route is retried or surfaced promptly instead of
 // consuming most of the client's idle window before any invocation exists.
@@ -111,8 +112,8 @@ export interface ChatHubRequest {
   sessionId: string;
   started: boolean;
   tone: string;
-  /** Already-normalized image inputs. The ChatHub boundary validates again. */
-  attachments?: ReadonlyArray<NormalizedImageAttachment>;
+  /** Already-normalized media inputs. The ChatHub boundary validates again. */
+  attachments?: ReadonlyArray<NormalizedMediaAttachment>;
   tools?: unknown[];
   toolChoice?: unknown;
   /** Optional protocol profile. Existing callers remain compatible: requests
@@ -121,6 +122,9 @@ export interface ChatHubRequest {
   messageProfile?: "answer" | "caller_tool" | "router";
   signal?: AbortSignal;
   deadlineAt?: number;
+  /** Maximum wait after invocation submission for the first real model,
+   * tool, image or reasoning progress. SignalR pings never satisfy it. */
+  firstOutputTimeoutMs?: number;
 }
 
 export interface ChatHubResult {
@@ -1188,10 +1192,12 @@ function webSocketURL(account: OAuthTokenSet, sessionId: string, conversationId:
   return url.toString();
 }
 
-export interface ChatHubImageAttachment {
-  type: "image";
+export interface ChatHubMediaAttachment {
+  type: "image" | "file" | "audio";
   url: string;
   mimeType: string;
+  name?: string;
+  detail?: "auto" | "high" | "low";
 }
 
 /**
@@ -1199,19 +1205,21 @@ export interface ChatHubImageAttachment {
  * adapter. This must run before dialing ChatHub so a malformed or oversized
  * image can never consume an account connection.
  */
-export function chatHubAttachments(value: unknown): ChatHubImageAttachment[] {
+export function chatHubAttachments(value: unknown): ChatHubMediaAttachment[] {
   if (value == null) return [];
   if (!Array.isArray(value)) throw new Error("INVALID_CHAT_HUB_ATTACHMENTS");
   const normalized = normalizeMultimodalContent(value);
-  // ChatHubRequest.attachments is image-only. Reject runtime callers that try
-  // to smuggle text or unsupported content through the internal field.
+  // Reject runtime callers that try to smuggle text or unsupported content
+  // through the internal attachment field.
   if (normalized.text || normalized.attachments.length !== value.length) {
     throw new Error("INVALID_CHAT_HUB_ATTACHMENTS");
   }
   return normalized.attachments.map((attachment) => ({
-    type: "image",
+    type: attachment.type,
     url: attachment.url,
     mimeType: attachment.mimeType,
+    ...("name" in attachment ? { name: attachment.name } : {}),
+    ...("detail" in attachment ? { detail: attachment.detail } : {}),
   }));
 }
 
@@ -1297,7 +1305,7 @@ const UPLOADED_IMAGE_OPTION_SETS = Object.freeze([
   "rich_responses",
 ]);
 
-function buildChatPayload(request: ChatHubRequest, requestId: string, attachments: ChatHubImageAttachment[], uploadedImages: ReadonlyArray<UploadedConversationImage> = []): string {
+function buildChatPayload(request: ChatHubRequest, requestId: string, attachments: ChatHubMediaAttachment[], uploadedImages: ReadonlyArray<UploadedConversationImage> = []): string {
   if (uploadedImages.some(image => image.conversationId !== request.conversationId)) throw new Error("IMAGE_UPLOAD_NOT_BOUND");
   // This ChatHub route uses the Avalon wire shape: variants on the connection
   // and ImageFile entries in messageAnnotations. Mixing the non-Avalon
@@ -1542,7 +1550,7 @@ export function preserveChatHubSubmissionHistory(cause: unknown, invocationSubmi
  */
 export function mayFailOverChatHubFailure(cause: unknown): boolean {
   const message = failureMessage(cause).toUpperCase();
-  if (message === "REQUEST_ABORTED" || message === "CHAT_DEADLINE_EXCEEDED" || message === "CHAT_PROGRESS_TIMEOUT") return false;
+  if (["REQUEST_ABORTED", "CHAT_DEADLINE_EXCEEDED", "CHAT_PROGRESS_TIMEOUT", "CHAT_FIRST_OUTPUT_TIMEOUT"].includes(message)) return false;
   return !(cause instanceof ChatHubAttemptError) || !cause.invocationSubmitted;
 }
 
@@ -1592,6 +1600,29 @@ export async function nextProgressBoundedChatHubFrame(
       && Date.now() >= progressDeadlineAt
     ) {
       throw new Error("CHAT_PROGRESS_TIMEOUT");
+    }
+    throw cause;
+  }
+}
+
+export async function nextOutputBoundedChatHubFrame(
+  reader: Pick<SocketReader, "next">,
+  requestDeadlineAt: number,
+  progressDeadlineAt: number,
+  firstOutputDeadlineAt: number,
+  sawOutput: boolean,
+): Promise<string> {
+  const effectiveProgressDeadline = sawOutput
+    ? progressDeadlineAt
+    : Math.min(progressDeadlineAt, firstOutputDeadlineAt);
+  try {
+    return await nextProgressBoundedChatHubFrame(reader, requestDeadlineAt, effectiveProgressDeadline);
+  } catch (cause) {
+    if (!sawOutput
+      && failureMessage(cause) === "CHAT_PROGRESS_TIMEOUT"
+      && firstOutputDeadlineAt <= progressDeadlineAt
+      && Date.now() >= firstOutputDeadlineAt) {
+      throw new Error("CHAT_FIRST_OUTPUT_TIMEOUT");
     }
     throw cause;
   }
@@ -2035,9 +2066,20 @@ async function runChatHub(
       };
     };
   let progressDeadline = Math.min(deadline, Date.now() + CHAT_PROGRESS_IDLE_TIMEOUT_MS);
+    const configuredFirstOutput = Number.isFinite(request.firstOutputTimeoutMs)
+      ? Math.max(5_000, Math.min(300_000, Math.trunc(request.firstOutputTimeoutMs!)))
+      : CHAT_FIRST_OUTPUT_TIMEOUT_MS;
+    const firstOutputDeadline = Math.min(deadline, Date.now() + configuredFirstOutput);
+    let sawOutput = false;
     let signalRRecords = 0;
     while (Date.now() < deadline) {
-      const frame = pendingFrame || await nextProgressBoundedChatHubFrame(reader, deadline, progressDeadline);
+      const frame = pendingFrame || await nextOutputBoundedChatHubFrame(
+        reader,
+        deadline,
+        progressDeadline,
+        firstOutputDeadline,
+        sawOutput,
+      );
       pendingFrame = "";
       let semanticProgress = false;
       for (const part of signalRFrameParts(frame)) {
@@ -2063,12 +2105,14 @@ async function runChatHub(
         const priorImageCount = images.length;
         images = appendUpstreamImageURLs(images, event);
         if (images.length > priorImageCount) {
+          sawOutput = true;
           semanticProgress = true;
           onSemanticProgress?.();
         }
         const parsedFunctionCall = parseNativeFunctionCall(event, request.tools);
         if (!parsedFunctionCall && hasNativeFunctionCallEnvelope(event)) malformedFunctionCall = true;
         if (!functionCall && parsedFunctionCall) {
+          sawOutput = true;
           semanticProgress = true;
           onSemanticProgress?.();
         }
@@ -2096,6 +2140,7 @@ async function runChatHub(
             }
             const update = raw;
             if (chatHubUpdateHasSemanticProgress(update)) {
+              sawOutput = true;
               semanticProgress = true;
               onSemanticProgress?.();
             }
@@ -2129,6 +2174,7 @@ async function runChatHub(
           continue;
         }
         if (type === 2) {
+          sawOutput = true;
           semanticProgress = true;
           onSemanticProgress?.();
           const item = isRecord(event.item) ? event.item : undefined;
@@ -2236,8 +2282,10 @@ export async function chatHub(
   const boundedRequest = { ...request, deadlineAt, signal };
   // Upload once before transport retries. A failed upload never falls through
   // to a text-only invocation. Nothing changes for requests without images.
-  const uploadedImages = await uploadConversationImages(account, request.conversationId, request.attachments, signal);
-  let attemptRequest = request.attachments?.length ? { ...boundedRequest, attachments: [] } : boundedRequest;
+  const imageAttachments = request.attachments?.filter((attachment) => attachment.type === "image") ?? [];
+  const directAttachments = request.attachments?.filter((attachment) => attachment.type !== "image") ?? [];
+  const uploadedImages = await uploadConversationImages(account, request.conversationId, imageAttachments, signal);
+  let attemptRequest = imageAttachments.length ? { ...boundedRequest, attachments: directAttachments } : boundedRequest;
   let invocationSubmitted = false;
   // One bounded reconnect is allowed only before any semantic delta. A
   // post-submit disconnect uses fresh conversation coordinates, while a

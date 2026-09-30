@@ -5,9 +5,106 @@ interface ModelSpec {
   maxOutputTokens: number;
   reasoning: boolean;
   availability?: "standard" | "tenant_dependent";
+  tone?: string;
+  reasoningTone?: string;
+}
+
+export interface RuntimeModelDefinition {
+  id: string;
+  tone: string;
+  reasoningTone?: string;
+  owner?: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  reasoning?: boolean;
+}
+
+export interface RuntimeModelConfiguration {
+  aliases: Record<string, string>;
+  models: RuntimeModelDefinition[];
+}
+
+let runtimeModelConfiguration: RuntimeModelConfiguration = { aliases: {}, models: [] };
+
+function modelIdentifier(value: unknown): string {
+  if (typeof value !== "string") throw new Error("INVALID_MODEL_CONFIGURATION");
+  const id = value.trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(id)) throw new Error("INVALID_MODEL_CONFIGURATION");
+  return id;
+}
+
+function upstreamTone(value: unknown): string {
+  if (typeof value !== "string") throw new Error("INVALID_MODEL_CONFIGURATION");
+  const tone = value.trim();
+  if (!/^[A-Za-z][A-Za-z0-9_]{0,127}$/u.test(tone)) throw new Error("INVALID_MODEL_CONFIGURATION");
+  return tone;
+}
+
+export function normalizeRuntimeModelConfiguration(value: unknown): RuntimeModelConfiguration {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { aliases: {}, models: [] };
+  const raw = value as { aliases?: unknown; models?: unknown };
+  const aliases: Record<string, string> = {};
+  if (raw.aliases !== undefined) {
+    if (!raw.aliases || typeof raw.aliases !== "object" || Array.isArray(raw.aliases)) throw new Error("INVALID_MODEL_CONFIGURATION");
+    const entries = Object.entries(raw.aliases as Record<string, unknown>);
+    if (entries.length > 64) throw new Error("INVALID_MODEL_CONFIGURATION");
+    for (const [key, target] of entries) aliases[modelIdentifier(key)] = modelIdentifier(target);
+  }
+  if (raw.models !== undefined && !Array.isArray(raw.models)) throw new Error("INVALID_MODEL_CONFIGURATION");
+  const definitions = (raw.models ?? []) as unknown[];
+  if (definitions.length > 32) throw new Error("INVALID_MODEL_CONFIGURATION");
+  const seen = new Set<string>();
+  const models = definitions.map((item): RuntimeModelDefinition => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("INVALID_MODEL_CONFIGURATION");
+    const input = item as Record<string, unknown>;
+    const id = modelIdentifier(input.id);
+    if (seen.has(id) || MODELS.some((model) => model.id === id)) throw new Error("INVALID_MODEL_CONFIGURATION");
+    seen.add(id);
+    const contextWindow = input.contextWindow === undefined ? 224_000 : Number(input.contextWindow);
+    const maxOutputTokens = input.maxOutputTokens === undefined ? 128_000 : Number(input.maxOutputTokens);
+    if (!Number.isInteger(contextWindow) || contextWindow < 16_000 || contextWindow > 2_000_000
+      || !Number.isInteger(maxOutputTokens) || maxOutputTokens < 1_024 || maxOutputTokens >= contextWindow) {
+      throw new Error("INVALID_MODEL_CONFIGURATION");
+    }
+    return {
+      id,
+      tone: upstreamTone(input.tone),
+      ...(input.reasoningTone === undefined ? {} : { reasoningTone: upstreamTone(input.reasoningTone) }),
+      owner: typeof input.owner === "string" ? input.owner.trim().slice(0, 64) || "microsoft-365" : "microsoft-365",
+      contextWindow,
+      maxOutputTokens,
+      reasoning: input.reasoning !== false,
+    };
+  });
+  const targets = new Set([...MODELS.map((model) => model.id), ...models.map((model) => model.id)]);
+  for (const target of Object.values(aliases)) if (!targets.has(target)) throw new Error("INVALID_MODEL_CONFIGURATION");
+  return { aliases, models };
+}
+
+export function applyRuntimeModelConfiguration(value: unknown): RuntimeModelConfiguration {
+  runtimeModelConfiguration = normalizeRuntimeModelConfiguration(value);
+  return runtimeModelConfiguration;
+}
+
+export function currentRuntimeModelConfiguration(): RuntimeModelConfiguration {
+  return structuredClone(runtimeModelConfiguration);
+}
+
+function allModels(): ModelSpec[] {
+  return [...MODELS, ...runtimeModelConfiguration.models.map((model) => ({
+    id: model.id,
+    owner: model.owner ?? "microsoft-365",
+    contextWindow: model.contextWindow ?? 224_000,
+    maxOutputTokens: model.maxOutputTokens ?? 128_000,
+    reasoning: model.reasoning !== false,
+    availability: "tenant_dependent" as const,
+    tone: model.tone,
+    reasoningTone: model.reasoningTone,
+  }))];
 }
 
 const MODELS: ModelSpec[] = [
+  { id: "m365-image", owner: "microsoft-365", contextWindow: 32_000, maxOutputTokens: 4_096, reasoning: false, availability: "tenant_dependent", tone: "Magic" },
   // These GPT-5 routes are present in the Go gateway's maintained catalog.
   // They remain tenant-dependent until a live tenant successfully answers.
   { id: "gpt-5.2", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true, availability: "tenant_dependent" },
@@ -63,8 +160,8 @@ export function canonicalModel(value: unknown): string {
   if (value !== undefined && value !== null && typeof value !== "string") throw new Error("UNSUPPORTED_MODEL");
   const normalized = typeof value === "string" ? value.trim() : "";
   const requested = (normalized || "gpt-5.6-sol").toLowerCase();
-  const canonical = ALIASES[requested] ?? requested;
-  if (!MODELS.some((model) => model.id === canonical)) throw new Error("UNSUPPORTED_MODEL");
+  const canonical = runtimeModelConfiguration.aliases[requested] ?? ALIASES[requested] ?? requested;
+  if (!allModels().some((model) => model.id === canonical)) throw new Error("UNSUPPORTED_MODEL");
   return canonical;
 }
 
@@ -75,6 +172,8 @@ export function modelTone(model: string, effort: unknown = ""): string {
   // reached (which used to surface as an opaque 500/502).
   const normalizedEffort = typeof effort === "string" ? effort.trim().toLowerCase() : "";
   const wantsReasoning = !["none", "minimal", "low"].includes(normalizedEffort) && normalizedEffort !== "";
+  const runtime = allModels().find((candidate) => candidate.id === model && candidate.tone);
+  if (runtime?.tone) return wantsReasoning && runtime.reasoningTone ? runtime.reasoningTone : runtime.tone;
   switch (model) {
     case "gpt-5.2": return wantsReasoning ? "Gpt_5_2_Reasoning" : "Gpt_5_2_Chat";
     case "gpt-5.2-reasoning": return "Gpt_5_2_Reasoning";
@@ -101,14 +200,14 @@ export function modelTone(model: string, effort: unknown = ""): string {
 // Keep a conservative character ceiling so large client histories cannot make
 // a Worker allocate the entire request several times during prompt assembly.
 export function modelPromptCharacterLimit(model: string): number {
-  const spec = MODELS.find((candidate) => candidate.id === model);
+  const spec = allModels().find((candidate) => candidate.id === model);
   if (!spec) throw new Error("UNSUPPORTED_MODEL");
   const usableTokens = spec.contextWindow - spec.maxOutputTokens;
   return Math.min(3_000_000, Math.max(64_000, Math.floor(usableTokens * 3)));
 }
 
 export function modelMaxInputTokens(model: string): number {
-  const spec = MODELS.find((candidate) => candidate.id === model);
+  const spec = allModels().find((candidate) => candidate.id === model);
   if (!spec) throw new Error("UNSUPPORTED_MODEL");
   return spec.contextWindow - spec.maxOutputTokens;
 }
@@ -214,7 +313,7 @@ export const CODEX_BASE_INSTRUCTIONS = [
 ].join(" ");
 
 export function modelCatalog(): Record<string, unknown>[] {
-  return MODELS.map((model) => ({
+  return allModels().map((model) => ({
     id: model.id,
     object: "model",
     owned_by: model.owner,
@@ -229,15 +328,15 @@ export function modelCatalog(): Record<string, unknown>[] {
       ...(hasVerifiedPublicSummary(model) ? { summary_delivery: "end_of_turn", public_only: true } : {}) },
     ...(model.availability ? { x_m365_availability: model.availability } : {}),
     capabilities: {
-      chat_completions: true,
-      responses: true,
-      streaming: true,
-      tools: true,
+      chat_completions: model.tone !== "Magic",
+      responses: model.tone !== "Magic",
+      streaming: model.tone !== "Magic",
+      tools: model.tone !== "Magic",
       reasoning: model.reasoning,
-      vision: false,
-      image_generation: false,
+      vision: model.tone === "Magic",
+      image_generation: model.tone === "Magic",
       audio: false,
-      modalities: ["text"],
+      modalities: model.tone === "Magic" ? ["text", "image"] : ["text"],
     },
   }));
 }
@@ -253,7 +352,7 @@ export function codexModelCatalog(clientVersion = ""): { models: Record<string, 
   // send X-OpenAI-Internal-Codex-Responses-Lite and reject the model locally.
   const responsesLite = false;
   return {
-    models: MODELS.map((model, index) => {
+    models: allModels().filter((model) => model.tone !== "Magic").map((model, index) => {
       return {
       slug: model.id,
       display_name: model.id,

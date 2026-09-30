@@ -54,16 +54,16 @@ function start(signal?: AbortSignal) {
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("bounded ChatHub idle and overall deadlines", () => {
-  it("fails a completely silent submitted invocation at 90 seconds without replay or fabricated completion", async () => {
+  it("fails a completely silent submitted invocation at the first-output deadline without replay", async () => {
     vi.useFakeTimers();
     const run = start();
     await run.socket.submitted;
-    await vi.advanceTimersByTimeAsync(89_999);
+    await vi.advanceTimersByTimeAsync(74_999);
     expect(run.settled()).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
     const outcome = await run.outcome;
     expect(outcome.result).toBeUndefined();
-    expect(outcome.error).toMatchObject({ message: "CHAT_PROGRESS_TIMEOUT" });
+    expect(outcome.error).toMatchObject({ message: "CHAT_FIRST_OUTPUT_TIMEOUT" });
     expect(chatHubInvocationWasSubmitted(outcome.error)).toBe(true);
     expect(run.socket.closed).toBe(true);
     expect(run.socket.invocationCount).toBe(1);
@@ -71,15 +71,27 @@ describe("bounded ChatHub idle and overall deadlines", () => {
     expect(run.emitted).toEqual([]);
   });
 
-  it.each([
-    { label: "SignalR heartbeat", frame: { type: 6 } },
-    { label: "public progress summary", frame: { type: 1, target: "update", arguments: [{ messages: [
-      { author: "bot", messageType: "Progress", contentOrigin: "ChainOfThoughtSummary", text: "Public activity fixture.", messageId: "summary-fixture" },
-    ] }] } },
-  ])("bounds endless $label at the ten-minute overall deadline, never as a successful answer", async ({ frame }) => {
+  it("does not let SignalR heartbeats satisfy the first-output deadline", async () => {
     vi.useFakeTimers();
     const run = start();
     await run.socket.submitted;
+    const interval = setInterval(() => run.socket.receive({ type: 6 }), 30_000);
+    try {
+      await vi.advanceTimersByTimeAsync(75_000);
+      const outcome = await run.outcome;
+      expect(outcome.error).toMatchObject({ message: "CHAT_FIRST_OUTPUT_TIMEOUT" });
+      expect(run.socket.invocationCount).toBe(1);
+      expect(run.fetchMock).toHaveBeenCalledTimes(1);
+    } finally { clearInterval(interval); }
+  });
+
+  it("bounds endless public progress summaries at the overall deadline", async () => {
+    vi.useFakeTimers();
+    const run = start();
+    await run.socket.submitted;
+    const frame = { type: 1, target: "update", arguments: [{ messages: [
+      { author: "bot", messageType: "Progress", contentOrigin: "ChainOfThoughtSummary", text: "Public activity fixture.", messageId: "summary-fixture" },
+    ] }] };
     const interval = setInterval(() => run.socket.receive(frame), 30_000);
     try {
       await vi.advanceTimersByTimeAsync(599_999);

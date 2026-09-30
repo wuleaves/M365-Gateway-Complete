@@ -76,6 +76,7 @@ export function classifyAccountFailure(cause: unknown): AccountFailureDispositio
     || upper.startsWith("CHAT_CLOSED_BEFORE_COMPLETION")
     || upper === "CHAT_DEADLINE_EXCEEDED"
     || upper === "CHAT_PROGRESS_TIMEOUT"
+    || upper === "CHAT_FIRST_OUTPUT_TIMEOUT"
     || upper === "CHAT_RETURNED_NO_CONTENT"
   ) {
     return { kind: "transient", mayFailOverBeforeVisibleOutput: true };

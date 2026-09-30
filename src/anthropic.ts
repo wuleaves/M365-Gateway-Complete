@@ -45,10 +45,12 @@ interface OpenAIErrorBody {
 interface OpenAIChoice {
   message?: {
     content?: unknown;
+    reasoning_content?: unknown;
     tool_calls?: unknown;
   };
   delta?: {
     content?: unknown;
+    reasoning_content?: unknown;
     tool_calls?: unknown;
   };
   finish_reason?: unknown;
@@ -387,6 +389,9 @@ function nonStreamingMessage(body: OpenAICompletion, requestedModel: string): Re
   const choice = firstChoice(body.choices);
   const message = isRecord(choice.message) ? choice.message : {};
   const content: Record<string, unknown>[] = [];
+  if (typeof message.reasoning_content === "string" && message.reasoning_content.length > 0) {
+    content.push({ type: "thinking", thinking: message.reasoning_content, signature: "" });
+  }
   if (typeof message.content === "string" && message.content.length > 0) content.push({ type: "text", text: message.content });
   if (Array.isArray(message.tool_calls)) {
     for (const raw of message.tool_calls) {
@@ -515,7 +520,7 @@ function streamingResponse(
       let buffer = "";
       let blockIndex = -1;
       let blockOpen = false;
-      let currentBlock: "text" | "tool" | "" = "";
+      let currentBlock: "thinking" | "text" | "tool" | "" = "";
       type ToolStreamState = {
         id: string;
         name: string;
@@ -550,6 +555,14 @@ function streamingResponse(
         blockOpen = true;
         currentBlock = "text";
         send("content_block_start", { index: blockIndex, content_block: { type: "text", text: "" } });
+      };
+      const startThinking = (): void => {
+        if (blockOpen && currentBlock === "thinking") return;
+        closeBlock();
+        blockIndex += 1;
+        blockOpen = true;
+        currentBlock = "thinking";
+        send("content_block_start", { index: blockIndex, content_block: { type: "thinking", thinking: "", signature: "" } });
       };
       const startTool = (index: number, state: ToolStreamState): boolean => {
         if (!state.id || !state.name) return false;
@@ -640,6 +653,10 @@ function streamingResponse(
           return;
         }
         const delta = isRecord(choice.delta) ? choice.delta : {};
+        if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
+          startThinking();
+          send("content_block_delta", { index: blockIndex, delta: { type: "thinking_delta", thinking: delta.reasoning_content } });
+        }
         if (typeof delta.content === "string" && delta.content.length > 0) {
           startText();
           send("content_block_delta", { index: blockIndex, delta: { type: "text_delta", text: delta.content } });

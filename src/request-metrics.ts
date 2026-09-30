@@ -3,6 +3,7 @@ import { countPromptTokenClasses } from "./models";
 
 const MAX_METRIC_TOKENS = 1_000_000_000;
 const MAX_ACCOUNT_ID_LENGTH = 256;
+const MAX_DIMENSION_LENGTH = 128;
 export const SLOW_REQUEST_OBSERVATION_MS = 45_000;
 export const SUCCESS_OBSERVATION_SAMPLE_DENOMINATOR = 64;
 
@@ -57,6 +58,12 @@ function boundedInteger(value: unknown, maximum: number): number {
 function normalizedAccountId(value: string | null | undefined): string {
   if (typeof value !== "string") return "";
   return value.trim().slice(0, MAX_ACCOUNT_ID_LENGTH);
+}
+
+function normalizedDimension(value: string | null | undefined): string {
+  if (typeof value !== "string") return "";
+  const normalized = value.trim().toLowerCase().slice(0, MAX_DIMENSION_LENGTH);
+  return /^[a-z0-9_.:-]+$/u.test(normalized) ? normalized : "";
 }
 
 function isHighSurrogate(value: string): boolean {
@@ -124,6 +131,9 @@ export class RequestMetricTracker {
   private readonly now: () => number;
   private readonly startedAt: number;
   private accountId: string;
+  private apiKeyId = "";
+  private model = "";
+  private endpoint = "";
   private terminalPromise: Promise<void> | undefined;
   private terminalValue: RequestSemanticStatus | undefined;
   private failureCode = "";
@@ -145,6 +155,18 @@ export class RequestMetricTracker {
   setAccountId(accountId: string | null | undefined): void {
     if (this.terminalPromise) return;
     this.accountId = normalizedAccountId(accountId);
+  }
+
+  setAPIKeyId(apiKeyId: string | null | undefined): void {
+    if (!this.terminalPromise) this.apiKeyId = normalizedDimension(apiKeyId);
+  }
+
+  setModel(model: string | null | undefined): void {
+    if (!this.terminalPromise) this.model = normalizedDimension(model);
+  }
+
+  setEndpoint(endpoint: string | null | undefined): void {
+    if (!this.terminalPromise) this.endpoint = normalizedDimension(endpoint);
   }
 
   observeInputText(value: string): void {
@@ -197,6 +219,9 @@ export class RequestMetricTracker {
     const metric: RequestMetricInput = {
       requestId: this.requestId,
       accountId: this.accountId || null,
+      apiKeyId: this.apiKeyId || null,
+      model: this.model,
+      endpoint: this.endpoint,
       status: boundedInteger(terminal.httpStatus, 999),
       semanticStatus: terminal.semanticStatus,
       ...(this.failureCode ? { code: this.failureCode } : {}),
