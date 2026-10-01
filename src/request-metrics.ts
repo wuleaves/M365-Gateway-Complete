@@ -134,6 +134,7 @@ export class RequestMetricTracker {
   private apiKeyId = "";
   private model = "";
   private endpoint = "";
+  private sessionReused: boolean | undefined;
   private terminalPromise: Promise<void> | undefined;
   private terminalValue: RequestSemanticStatus | undefined;
   private failureCode = "";
@@ -167,6 +168,10 @@ export class RequestMetricTracker {
 
   setEndpoint(endpoint: string | null | undefined): void {
     if (!this.terminalPromise) this.endpoint = normalizedDimension(endpoint);
+  }
+
+  setSessionReused(value: boolean): void {
+    if (!this.terminalPromise) this.sessionReused = value;
   }
 
   observeInputText(value: string): void {
@@ -222,6 +227,7 @@ export class RequestMetricTracker {
       apiKeyId: this.apiKeyId || null,
       model: this.model,
       endpoint: this.endpoint,
+      sessionReused: this.sessionReused,
       status: boundedInteger(terminal.httpStatus, 999),
       semanticStatus: terminal.semanticStatus,
       ...(this.failureCode ? { code: this.failureCode } : {}),

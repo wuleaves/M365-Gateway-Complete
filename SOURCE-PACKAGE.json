@@ -1,8 +1,8 @@
 {
   "package": "M365-Gateway-Complete",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "createdAt": "2026-09-29T22:00:00+08:00",
-  "updatedAt": "2026-10-01T20:55:00+08:00",
+  "updatedAt": "2026-10-01T21:24:00+08:00",
   "source": "consolidated-from-supplied-archives",
   "base": "M365-Gateway-Cloudflare-UI-Mobile-20260917-r9.zip",
   "restoredFrom": "M365-Gateway-OpenSource-20260913.zip",
@@ -15,7 +15,8 @@
     "tests and validation scripts",
     "public reasoning_content plus Anthropic thinking, bounded Responses metadata and cross-chunk citation cleanup",
     "explicit sessions, file/audio media, image generation/edit/variation and first-output timeout",
-    "cloud conversations, memory, plugins, MCP, runtime models, account health, dimension usage APIs and timezone-aware usage trends",
+    "cloud conversations with bound-session cleanup protection, memory, plugins, MCP, runtime models, account health, usage dimensions and timezone-aware trends",
+    "registered session management and exact successful session-reuse counts",
     "optional fixed-target Go egress relay"
   ],
   "excludes": [
@@ -29,8 +30,8 @@
     "npmCheck": "passed",
     "typecheck": "passed",
     "adminUiContract": "passed",
-    "testFiles": 29,
-    "tests": 521,
+    "testFiles": 30,
+    "tests": 524,
     "cloudflareDryRun": "passed",
     "npmAudit": "dependency-set-unchanged; network advisory check not rerun",
     "secretScan": "passed-no-findings",

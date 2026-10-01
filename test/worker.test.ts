@@ -41,6 +41,20 @@ async function finishTotp(response: Response): Promise<Response> {
 }
 
 describe("Worker HTTP contract", () => {
+  it("accumulates exact minute usage and successful session reuse without a per-request history row", async () => {
+    const state = env.TENANTS.getByName(`usage-${crypto.randomUUID()}`);
+    await state.recordRequestAggregate({ requestId: crypto.randomUUID(), status: 200, tokenIn: 8, tokenOut: 2, sessionReused: false });
+    await state.recordRequestAggregate({ requestId: crypto.randomUUID(), status: 200, tokenIn: 3, tokenOut: 4, sessionReused: true });
+    await state.recordRequestAggregate({ requestId: crypto.randomUUID(), status: 503, tokenIn: 1, tokenOut: 0, sessionReused: true });
+    const trend = await state.usageTrend(1, "Asia/Shanghai");
+    expect(trend.points.reduce((sum, point) => sum + point.requests, 0)).toBe(3);
+    expect(trend.points.reduce((sum, point) => sum + point.errors, 0)).toBe(1);
+    expect(trend.points.reduce((sum, point) => sum + point.tokenIn + point.tokenOut, 0)).toBe(18);
+    expect(await state.sessionReuseStats()).toEqual({ hits: 1, misses: 1, hitRate: 0.5 });
+    await state.resetRequestStats();
+    expect((await state.usageTrend(1, "UTC")).points).toEqual([]);
+  });
+
   it("installs the deployment-synced API key without exposing plaintext state", async () => {
     const response = await SELF.fetch("https://example.com/v1/models", {
       headers: { Authorization: "Bearer m365_test_deployment_key_1234567890" },

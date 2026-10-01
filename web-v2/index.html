@@ -1400,6 +1400,7 @@
               <span id="trendSummary">正在读取趋势数据…</span>
               <span id="trendRange">统计从升级后开始，按所选时区显示</span>
             </div>
+            <div id="reuseSummary" style="font-size:11px;color:var(--text-dim);margin-top:8px">正在读取会话复用统计…</div>
           </div>
         </div>
 
@@ -1550,14 +1551,12 @@
         </div>
       </section>
 
-      <!-- 5. 会话管理：Cloudflare 不提供 Durable Object 命名空间枚举 -->
+      <!-- 5. 已登记显式会话管理 -->
       <section id="view-sessions" class="view-panel">
         <div class="glass-panel" style="padding:26px">
-          <div class="card-title-bar"><div><h2 class="card-heading">会话管理</h2><p style="font-size:12px;color:var(--text-dim);margin-top:5px">保留 Go 版的运维入口，但遵守 Cloudflare Durable Objects 的隔离边界。</p></div></div>
-          <div style="margin-top:18px;padding:18px;border:1px solid var(--table-border);border-radius:var(--radius-md);font-size:13px;line-height:1.75">
-            当前 Cloudflare 版本的每个客户端会话由独立的 <span class="mono-tag">ChatSession Durable Object</span> 管理，平台不提供全局枚举接口，因此这里不会伪造“全部会话列表”或提供不可靠的批量删除按钮。会话会按 30 天无更新自动过期；请求诊断、Responses 别名和会话状态仍由对应 Durable Object 按边界保存。
-          </div>
-          <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap"><span class="badge-glass badge-emerald">会话隔离：开启</span><span class="badge-glass badge-blue">自动过期：30 天</span><span class="badge-glass badge-amber">全局枚举：平台不支持</span></div>
+          <div class="card-title-bar"><div><h2 class="card-heading">会话管理</h2><p style="font-size:12px;color:var(--text-dim);margin-top:5px">显示已登记的显式会话；临时会话不在列表中。</p></div><button class="btn btn-glass btn-sm" id="btnRefreshSessions">刷新</button></div>
+          <div class="glass-table-wrapper" style="margin-top:18px"><table><thead><tr><th>API Key</th><th>会话 ID</th><th>端点 / 模型</th><th>最近使用</th><th>消息数</th><th>操作</th></tr></thead><tbody id="adminSessionsBody"><tr><td colspan="6">正在读取会话…</td></tr></tbody></table></div>
+          <p style="font-size:11px;color:var(--text-dim);margin-top:12px">重置会话会清除本地续接状态；正在处理请求的会话不可重置。Cloudflare 不提供全部 Durable Object 的全局枚举。</p>
         </div>
       </section>
 
@@ -2135,6 +2134,7 @@
         document.getElementById("pageMainHeading").textContent = titles[name] || "运维中控台";
 
         if (name === "keys") loadKeys();
+        if (name === "sessions") loadAdminSessions();
         if (name === "diagnostics") loadLogs();
         if (name === "egress") loadEgress();
         if (name === "modeltest") loadModelTest();
@@ -2197,6 +2197,49 @@
           summary.textContent = error.message || "趋势数据暂不可用";
         }
       }
+
+      async function loadReuseStats() {
+        const output = document.getElementById("reuseSummary");
+        try {
+          const response = await fetch("/api/admin/usage/reuse");
+          if (!response.ok) throw new Error("统计暂不可用");
+          const data = await response.json();
+          const total = (data.hits || 0) + (data.misses || 0);
+          output.textContent = `成功请求的会话续用：${numStr(data.hits)} 次 / ${numStr(total)} 次 · 命中率 ${(100 * (data.hitRate || 0)).toFixed(1)}%`;
+        } catch { output.textContent = "会话续用统计暂不可用"; }
+      }
+
+      async function loadAdminSessions() {
+        const body = document.getElementById("adminSessionsBody");
+        if (!body) return;
+        body.innerHTML = '<tr><td colspan="6">正在读取会话…</td></tr>';
+        try {
+          const response = await fetch("/api/admin/sessions");
+          if (!response.ok) throw new Error("会话列表读取失败");
+          const data = await response.json();
+          const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+          body.innerHTML = sessions.length ? "" : '<tr><td colspan="6">暂无已登记的显式会话</td></tr>';
+          for (const session of sessions) {
+            const tr = document.createElement("tr");
+            tr.innerHTML = `<td>${escapeHtml(session.keyPrefix || "-")}</td><td class="mono-tag">${escapeHtml(session.id || "-")}</td><td>${escapeHtml(session.endpoint || "-")} / ${escapeHtml(session.model || "-")}</td><td>${escapeHtml(session.lastUsedAt ? new Date(session.lastUsedAt).toLocaleString() : "-")}</td><td>${numStr(session.messageCount)}</td><td><button class="btn btn-danger-glass btn-sm" type="button">重置</button></td>`;
+            tr.querySelector("button")?.addEventListener("click", async (event) => {
+              if (!confirm(`确认重置会话 ${session.id}？`)) return;
+              const button = event.currentTarget;
+              button.disabled = true;
+              try {
+                const result = await fetch("/api/admin/sessions/reset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ apiKeyId: session.apiKeyId, id: session.id }) });
+                const payload = await result.json().catch(() => ({}));
+                if (!result.ok) throw new Error(payload?.error?.message || "重置失败");
+                toast("会话已重置", "success");
+                await loadAdminSessions();
+              } catch (error) { toast(error.message || "重置失败", "error"); button.disabled = false; }
+            });
+            body.appendChild(tr);
+          }
+        } catch (error) { body.innerHTML = `<tr><td colspan="6">${escapeHtml(error.message || "会话列表读取失败")}</td></tr>`; }
+      }
+
+      document.getElementById("btnRefreshSessions")?.addEventListener("click", loadAdminSessions);
 
       document.getElementById("trendOneDay")?.addEventListener("click", () => { trendDays = 1; loadTrend(); });
       document.getElementById("trendSevenDays")?.addEventListener("click", () => { trendDays = 7; loadTrend(); });
@@ -2772,6 +2815,7 @@
         const ok = await syncAccounts();
         await loadLogs();
         await loadTrend();
+        await loadReuseStats();
         if (ok) toast("账号和诊断数据已同步", "success");
         button.disabled = false;
       });
@@ -2812,7 +2856,7 @@
             window.location.replace("/login");
             return;
           }
-          await Promise.all([syncHealth(), syncAccounts(), loadLogs(), loadPasskeys(), loadTrend()]);
+          await Promise.all([syncHealth(), syncAccounts(), loadLogs(), loadPasskeys(), loadTrend(), loadReuseStats()]);
         } catch {
           window.location.replace("/login");
         }
@@ -2820,7 +2864,10 @@
 
       initialize();
       setInterval(() => {
-        if (document.getElementById("view-dashboard")?.classList.contains("active")) loadTrend();
+        if (document.getElementById("view-dashboard")?.classList.contains("active")) {
+          loadTrend();
+          loadReuseStats();
+        }
       }, 60_000);
     })();
   </script>

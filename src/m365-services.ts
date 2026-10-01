@@ -195,13 +195,23 @@ export async function deleteCloudConversation(env: Env, conversationId: string):
   });
 }
 
-function conversationTime(item: Record<string, unknown>): number {
-  for (const key of ["lastUpdatedTime", "updatedAt", "createdAt", "lastModifiedTime", "timestamp"]) {
+function timestamp(value: unknown): number {
+  const time = typeof value === "number" ? value : typeof value === "string"
+    ? (/^\d{10,13}$/u.test(value) ? Number(value) : Date.parse(value)) : Number.NaN;
+  return Number.isFinite(time) && time > 0 ? time < 10_000_000_000 ? time * 1_000 : time : 0;
+}
+
+export function conversationActivityTime(item: Record<string, unknown>): number {
+  for (const key of ["lastUpdatedTime", "updatedAt", "lastModifiedTime", "timestamp"]) {
     const value = item[key];
-    const time = typeof value === "number" ? value : typeof value === "string" ? Date.parse(value) : Number.NaN;
-    if (Number.isFinite(time)) return time < 10_000_000_000 ? time * 1_000 : time;
+    const time = timestamp(value);
+    if (time) return time;
   }
   return 0;
+}
+
+function conversationTime(item: Record<string, unknown>): number {
+  return conversationActivityTime(item) || timestamp(item.createTimeUtc) || timestamp(item.createdAt);
 }
 
 function conversationId(item: Record<string, unknown>): string {
@@ -211,21 +221,34 @@ function conversationId(item: Record<string, unknown>): string {
   return "";
 }
 
+export function selectCloudCleanupCandidates(
+  conversations: Record<string, unknown>[], protectedIDs: ReadonlySet<string>,
+  maxAgeDays: number, keepLatest: number, now = Date.now(),
+): { targets: Record<string, unknown>[]; protected: number; skippedUnknownActivity: number } {
+  const keep = Math.max(0, Math.min(500, Math.trunc(keepLatest)));
+  const cutoff = now - Math.max(1, Math.min(3_650, maxAgeDays)) * 86_400_000;
+  const ordered = [...conversations].sort((a, b) => conversationTime(b) - conversationTime(a));
+  let protectedCount = 0;
+  let skippedUnknownActivity = 0;
+  const targets = ordered.slice(keep).filter((item) => {
+    if (protectedIDs.has(conversationId(item))) { protectedCount += 1; return false; }
+    const activity = conversationActivityTime(item);
+    if (!activity) { skippedUnknownActivity += 1; return false; }
+    return activity < cutoff;
+  }).slice(0, 20);
+  return { targets, protected: protectedCount, skippedUnknownActivity };
+}
+
 export async function cleanupCloudConversations(
   env: Env,
   maxAgeDays: number,
   keepLatest: number,
-): Promise<{ accountId: string; scanned: number; deleted: number; failed: number }> {
+): Promise<{ accountId: string; scanned: number; deleted: number; failed: number; protected: number; skippedUnknownActivity: number }> {
   const listed = await listCloudConversations(env);
   if (listed.status < 200 || listed.status >= 300) throw new Error("SERVICE_UPSTREAM_REJECTED");
   const conversations = ((listed.data as { conversations?: unknown }).conversations ?? []) as Record<string, unknown>[];
-  const keep = Math.max(0, Math.min(500, Math.trunc(keepLatest)));
-  const cutoff = Date.now() - Math.max(0, Math.min(3_650, maxAgeDays)) * 86_400_000;
-  const ordered = [...conversations].sort((a, b) => conversationTime(b) - conversationTime(a));
-  const targets = ordered.slice(keep).filter((item) => {
-    const timestamp = conversationTime(item);
-    return timestamp > 0 && timestamp < cutoff;
-  }).slice(0, 20);
+  const protectedIDs = await protectedCloudConversationIDs(env, listed.accountId);
+  const { targets, protected: protectedCount, skippedUnknownActivity } = selectCloudCleanupCandidates(conversations, protectedIDs, maxAgeDays, keepLatest);
   let deleted = 0;
   let failed = 0;
   for (const item of targets) {
@@ -237,5 +260,18 @@ export async function cleanupCloudConversations(
       else failed += 1;
     } catch { failed += 1; }
   }
-  return { accountId: listed.accountId, scanned: conversations.length, deleted, failed };
+  return { accountId: listed.accountId, scanned: conversations.length, deleted, failed, protected: protectedCount, skippedUnknownActivity };
+}
+
+export async function protectedCloudConversationIDs(env: Env, accountId: string): Promise<Set<string>> {
+  const registry = await tenant(env).protectedSessionObjectKeys();
+  if (!registry.complete) throw new Error("CLOUD_CLEANUP_REGISTRY_TOO_LARGE");
+  const protectedIDs = new Set<string>();
+  for (let index = 0; index < registry.keys.length; index += 10) {
+    const bindings = await Promise.all(registry.keys.slice(index, index + 10).map((key) => env.CHATS.getByName(key).conversationBinding()));
+    for (const binding of bindings) {
+      if (binding && binding.accountId === accountId && binding.conversationId) protectedIDs.add(binding.conversationId);
+    }
+  }
+  return protectedIDs;
 }

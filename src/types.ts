@@ -88,6 +88,8 @@ export interface RequestMetricInput {
   apiKeyId?: string | null;
   model?: string;
   endpoint?: string;
+  /** Exact reuse of an existing committed ChatSession, when observed. */
+  sessionReused?: boolean;
   /** HTTP status visible to the client, which can still be 200 for an SSE error. */
   status: number;
   /** Protocol-level terminal state, independent of the HTTP status. */

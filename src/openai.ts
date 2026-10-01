@@ -6190,12 +6190,15 @@ async function chatCompletions(request: Request, env: Env, metrics?: RequestMetr
   const tone = modelTone(model, parsed.reasoning_effort ?? "");
   const sessionKey = await chatSessionKey(request, parsed);
   const explicitSession = stableSessionCandidate(request, parsed);
-  if (/^[A-Za-z0-9_.:@-]{1,256}$/u.test(explicitSession)) {
+  const registeredExplicitSession = /^[A-Za-z0-9_.:@-]{1,256}$/u.test(explicitSession);
+  if (registeredExplicitSession) {
     await env.TENANTS.getByName(env.TENANT_NAME || "default")
       .registerSessionForCredential(apiCredential(request), explicitSession, sessionKey, "chat.completions", model);
   }
   const session = chatSession(env, sessionKey);
   const lease = await acquireConversationLease(env, session, deadlineAt, request.signal);
+  metrics?.setSessionReused(lease.started);
+  if (!registeredExplicitSession) await env.TENANTS.getByName(env.TENANT_NAME || "default").touchConversationSession(sessionKey);
   const chatToolsSnapshot = callerToolsSnapshot(parsed.tools);
   if (chatToolsSnapshot && typeof (session as unknown as { rememberCallerTools?: unknown }).rememberCallerTools === "function") {
     await (session as unknown as { rememberCallerTools(leaseId: string, toolsSnapshot: string): Promise<void> })
@@ -7378,7 +7381,8 @@ async function responsesCore(
   const compactedSession = await compactSessionState(request, parsed.input, encryptionKeys);
   const key = compactedSession?.sessionKey ?? await responsesSessionKey(request, parsed, encryptionKeys);
   const explicitSession = stableSessionCandidate(request, parsed);
-  if (/^[A-Za-z0-9_.:@-]{1,256}$/u.test(explicitSession)) {
+  const registeredExplicitSession = /^[A-Za-z0-9_.:@-]{1,256}$/u.test(explicitSession);
+  if (registeredExplicitSession) {
     await env.TENANTS.getByName(env.TENANT_NAME || "default")
       .registerSessionForCredential(apiCredential(request), explicitSession, key, "responses", model);
   }
@@ -7396,6 +7400,8 @@ async function responsesCore(
   } else {
     lease = await acquireConversationLease(env, session, deadlineAt, signal);
   }
+  if (!responseBranch) metrics?.setSessionReused(lease.started);
+  if (!responseBranch && !registeredExplicitSession) await env.TENANTS.getByName(env.TENANT_NAME || "default").touchConversationSession(key);
   const responseToolsSnapshot = callerToolsSnapshot(parsed.tools);
   if (responseToolsSnapshot && typeof (session as unknown as { rememberCallerTools?: unknown }).rememberCallerTools === "function") {
     await (session as unknown as { rememberCallerTools(leaseId: string, toolsSnapshot: string): Promise<void> })

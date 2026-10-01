@@ -233,6 +233,7 @@ function safeDiagnosticIdentifier(value: string, maximum: number, fallback = "re
 export class TenantState extends DurableObject<Env> {
   private metricWritesSincePrune = 0;
   private usageWritesSincePrune = 0;
+  private currentUsageMinute = 0;
   private diagnosticWritesSincePrune = 0;
   private readonly refreshInFlight = new Map<string, Promise<OAuthTokenSet>>();
   private readonly credentialMirrorInFlight = new Map<string, Promise<void>>();
@@ -355,7 +356,14 @@ export class TenantState extends DurableObject<Env> {
         error_count INTEGER NOT NULL DEFAULT 0 CHECK(error_count>=0),
         token_in INTEGER NOT NULL DEFAULT 0 CHECK(token_in>=0),
         token_out INTEGER NOT NULL DEFAULT 0 CHECK(token_out>=0),
-        last_request_at INTEGER NOT NULL DEFAULT 0 CHECK(last_request_at>=0)
+        last_request_at INTEGER NOT NULL DEFAULT 0 CHECK(last_request_at>=0),
+        current_minute INTEGER NOT NULL DEFAULT 0,
+        minute_requests INTEGER NOT NULL DEFAULT 0,
+        minute_errors INTEGER NOT NULL DEFAULT 0,
+        minute_token_in INTEGER NOT NULL DEFAULT 0,
+        minute_token_out INTEGER NOT NULL DEFAULT 0,
+        reuse_hits INTEGER NOT NULL DEFAULT 0,
+        reuse_misses INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS account_request_stats (
         account_id TEXT PRIMARY KEY,
@@ -415,6 +423,10 @@ export class TenantState extends DurableObject<Env> {
         message_count INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(api_key_id,public_id)
       );
+      CREATE TABLE IF NOT EXISTS session_object_registry (
+        object_key TEXT PRIMARY KEY,
+        last_seen_at INTEGER NOT NULL
+      );
     `);
     // The prune counters are intentionally kept in memory so terminal writes
     // do not perform an extra metadata write.  Rehydrate their phase once at
@@ -427,6 +439,11 @@ export class TenantState extends DurableObject<Env> {
       "SELECT COUNT(*) AS count FROM diagnostic_events",
     ).one().count % DIAGNOSTIC_PRUNE_INTERVAL;
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO request_totals(singleton) VALUES(1)");
+    const totalColumns = new Set(this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(request_totals)").toArray().map((column) => column.name));
+    for (const column of ["current_minute", "minute_requests", "minute_errors", "minute_token_in", "minute_token_out", "reuse_hits", "reuse_misses"]) {
+      if (!totalColumns.has(column)) this.ctx.storage.sql.exec(`ALTER TABLE request_totals ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`);
+    }
+    this.currentUsageMinute = this.ctx.storage.sql.exec<{ current_minute: number }>("SELECT current_minute FROM request_totals WHERE singleton=1").one().current_minute;
     const accountColumns = new Set(this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(accounts)").toArray().map((column) => column.name));
     if (!accountColumns.has("sequence_no")) this.ctx.storage.sql.exec("ALTER TABLE accounts ADD COLUMN sequence_no INTEGER NOT NULL DEFAULT 0");
     if (!accountColumns.has("credential_revision")) this.ctx.storage.sql.exec("ALTER TABLE accounts ADD COLUMN credential_revision INTEGER NOT NULL DEFAULT 0");
@@ -1192,6 +1209,10 @@ export class TenantState extends DurableObject<Env> {
     const durationMs = boundedInteger(input.durationMs, MAX_DIAGNOSTIC_DURATION_MS);
     const tokenIn = boundedInteger(input.tokenIn, MAX_METRIC_TOKENS);
     const tokenOut = boundedInteger(input.tokenOut, MAX_METRIC_TOKENS);
+    const minute = Math.floor(now / 60_000) * 60_000;
+    const previousMinute = this.currentUsageMinute;
+    const reuseHit = !errorCount && input.sessionReused === true ? 1 : 0;
+    const reuseMiss = !errorCount && input.sessionReused === false ? 1 : 0;
     let acceptedMetric = !retainDetail;
     const nextMetricPruneCount = this.metricWritesSincePrune + 1;
     const nextUsagePruneCount = this.usageWritesSincePrune + 1;
@@ -1214,23 +1235,33 @@ export class TenantState extends DurableObject<Env> {
         acceptedMetric = accepted;
         if (!accepted) return;
       }
+      if (previousMinute && previousMinute !== minute) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO request_usage_minutes(minute,requests,errors,token_in,token_out)
+           SELECT current_minute,minute_requests,minute_errors,minute_token_in,minute_token_out
+           FROM request_totals WHERE singleton=1 AND minute_requests>0
+           ON CONFLICT(minute) DO UPDATE SET
+           requests=requests+excluded.requests,errors=errors+excluded.errors,
+           token_in=token_in+excluded.token_in,token_out=token_out+excluded.token_out`,
+        );
+      }
       this.ctx.storage.sql.exec(
         `UPDATE request_totals SET request_count=request_count+1,error_count=error_count+?,
-         token_in=token_in+?,token_out=token_out+?,last_request_at=? WHERE singleton=1`,
+         token_in=token_in+?,token_out=token_out+?,last_request_at=?,
+         minute_requests=CASE WHEN current_minute=? THEN minute_requests+1 ELSE 1 END,
+         minute_errors=CASE WHEN current_minute=? THEN minute_errors+? ELSE ? END,
+         minute_token_in=CASE WHEN current_minute=? THEN minute_token_in+? ELSE ? END,
+         minute_token_out=CASE WHEN current_minute=? THEN minute_token_out+? ELSE ? END,
+         current_minute=?,reuse_hits=reuse_hits+?,reuse_misses=reuse_misses+?
+         WHERE singleton=1`,
         errorCount,
         tokenIn,
         tokenOut,
         now,
-      );
-      this.ctx.storage.sql.exec(
-        `INSERT INTO request_usage_minutes(minute,requests,errors,token_in,token_out)
-         VALUES(?,1,?,?,?) ON CONFLICT(minute) DO UPDATE SET
-         requests=requests+1,errors=errors+excluded.errors,
-         token_in=token_in+excluded.token_in,token_out=token_out+excluded.token_out`,
-        Math.floor(now / 60_000) * 60_000,
-        errorCount,
-        tokenIn,
-        tokenOut,
+        minute, minute, errorCount, errorCount,
+        minute, tokenIn, tokenIn,
+        minute, tokenOut, tokenOut,
+        minute, reuseHit, reuseMiss,
       );
       if (accountId) {
         this.ctx.storage.sql.exec(
@@ -1275,6 +1306,7 @@ export class TenantState extends DurableObject<Env> {
     });
     if (retainDetail && acceptedMetric) this.metricWritesSincePrune = pruneMetrics ? 0 : nextMetricPruneCount;
     if (acceptedMetric) this.usageWritesSincePrune = nextUsagePruneCount >= 256 ? 0 : nextUsagePruneCount;
+    if (acceptedMetric) this.currentUsageMinute = minute;
     return acceptedMetric;
   }
 
@@ -1375,19 +1407,35 @@ export class TenantState extends DurableObject<Env> {
       cutoff,
     ).toArray();
     const data: UsageTrendRow[] = rows.map((row) => ({ minute: row.minute, requests: row.requests, errors: row.errors, tokenIn: row.token_in, tokenOut: row.token_out }));
+    const current = this.ctx.storage.sql.exec<{ minute: number; requests: number; errors: number; token_in: number; token_out: number }>(
+      "SELECT current_minute AS minute,minute_requests AS requests,minute_errors AS errors,minute_token_in AS token_in,minute_token_out AS token_out FROM request_totals WHERE singleton=1",
+    ).one();
+    if (current.minute >= cutoff && current.requests > 0) {
+      data.push({ minute: current.minute, requests: current.requests, errors: current.errors, tokenIn: current.token_in, tokenOut: current.token_out });
+      data.sort((a, b) => a.minute - b.minute);
+    }
     return { days, timeZone, availableSince: data.length ? new Date(data[0].minute).toISOString() : null, ...aggregateUsageTrend(data, days, timeZone) };
+  }
+
+  async sessionReuseStats(): Promise<{ hits: number; misses: number; hitRate: number }> {
+    const row = this.ctx.storage.sql.exec<{ reuse_hits: number; reuse_misses: number }>(
+      "SELECT reuse_hits,reuse_misses FROM request_totals WHERE singleton=1",
+    ).one();
+    const total = row.reuse_hits + row.reuse_misses;
+    return { hits: row.reuse_hits, misses: row.reuse_misses, hitRate: total ? row.reuse_hits / total : 0 };
   }
 
   async resetRequestStats(): Promise<GatewayStats> {
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
-        "UPDATE request_totals SET request_count=0,error_count=0,token_in=0,token_out=0,last_request_at=0 WHERE singleton=1",
+        "UPDATE request_totals SET request_count=0,error_count=0,token_in=0,token_out=0,last_request_at=0,current_minute=0,minute_requests=0,minute_errors=0,minute_token_in=0,minute_token_out=0,reuse_hits=0,reuse_misses=0 WHERE singleton=1",
       );
       this.ctx.storage.sql.exec("DELETE FROM account_request_stats");
       this.ctx.storage.sql.exec("DELETE FROM recorded_request_metrics");
       this.ctx.storage.sql.exec("DELETE FROM request_usage_minutes");
       this.ctx.storage.sql.exec("DELETE FROM request_dimension_stats");
     });
+    this.currentUsageMinute = 0;
     return this.statsSnapshot();
   }
 
@@ -2394,6 +2442,57 @@ export class TenantState extends DurableObject<Env> {
       lastUsedAt: new Date(row.last_used_at).toISOString(),
       messageCount: row.message_count,
     }));
+  }
+
+  async listAdminSessions(limit = 200): Promise<Array<PublicSessionRecord & { apiKeyId: string; keyPrefix: string }>> {
+    const bounded = Math.max(1, Math.min(500, Math.trunc(limit) || 200));
+    return this.ctx.storage.sql.exec<{
+      api_key_id: string; prefix: string; public_id: string; endpoint: string; model: string;
+      created_at: number; last_used_at: number; message_count: number;
+    }>(
+      `SELECT s.api_key_id,k.prefix,s.public_id,s.endpoint,s.model,s.created_at,s.last_used_at,s.message_count
+       FROM session_registry s JOIN api_keys k ON k.id=s.api_key_id
+       ORDER BY s.last_used_at DESC LIMIT ?`, bounded,
+    ).toArray().map((row) => ({
+      apiKeyId: row.api_key_id,
+      keyPrefix: row.prefix,
+      id: row.public_id,
+      endpoint: row.endpoint,
+      model: row.model,
+      createdAt: new Date(row.created_at).toISOString(),
+      lastUsedAt: new Date(row.last_used_at).toISOString(),
+      messageCount: row.message_count,
+    }));
+  }
+
+  async adminSessionObjectKey(apiKeyId: string, publicId: string): Promise<string | null> {
+    const row = this.ctx.storage.sql.exec<{ object_key: string }>(
+      "SELECT object_key FROM session_registry WHERE api_key_id=? AND public_id=?",
+      safeDiagnosticIdentifier(apiKeyId, 128, ""), safeDiagnosticIdentifier(publicId, 256, ""),
+    ).toArray()[0];
+    return row?.object_key ?? null;
+  }
+
+  async protectedSessionObjectKeys(limit = 500): Promise<{ keys: string[]; complete: boolean }> {
+    const rows = this.ctx.storage.sql.exec<{ object_key: string }>(
+      `SELECT object_key FROM session_object_registry WHERE last_seen_at>=?
+       UNION SELECT object_key FROM session_registry WHERE last_used_at>=? LIMIT ?`,
+      Date.now() - 30 * 86_400_000, Date.now() - 30 * 86_400_000, limit + 1,
+    ).toArray();
+    return { keys: rows.slice(0, limit).map((row) => row.object_key), complete: rows.length <= limit };
+  }
+
+  async touchConversationSession(objectKey: string): Promise<void> {
+    const key = safeDiagnosticIdentifier(objectKey, 128, "");
+    if (!key) return;
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO session_object_registry(object_key,last_seen_at) VALUES(?,?)
+       ON CONFLICT(object_key) DO UPDATE SET last_seen_at=excluded.last_seen_at
+       WHERE session_object_registry.last_seen_at<?`,
+      key, now, now - 60 * 60_000,
+    );
+    if (Math.random() < 0.01) this.ctx.storage.sql.exec("DELETE FROM session_object_registry WHERE last_seen_at<?", now - 30 * 86_400_000);
   }
 
   async deleteSessionRegistration(apiKeyId: string, publicId: string): Promise<boolean> {

@@ -2196,6 +2196,15 @@ export class ChatSession extends DurableObject<Env> {
     };
   }
 
+  /** Internal-only binding used to protect live cloud conversations during cleanup. */
+  async conversationBinding(): Promise<{ conversationId: string; accountId: string; busy: boolean } | null> {
+    const row = this.ctx.storage.sql.exec<{
+      conversation_id: string; account_id: string; lease_until: number; updated_at: number; record_kind: string;
+    }>("SELECT conversation_id,account_id,lease_until,updated_at,record_kind FROM state WHERE singleton=1").toArray()[0];
+    if (!row || row.record_kind === "alias" || row.updated_at < Date.now() - SESSION_TTL_MS) return null;
+    return { conversationId: row.conversation_id, accountId: row.account_id, busy: row.lease_until > Date.now() };
+  }
+
   async reset(): Promise<"deleted" | "absent" | "busy"> {
     const row = this.ctx.storage.sql.exec<{ lease_until: number; record_kind: string; alias_generation: string }>(
       "SELECT lease_until,record_kind,alias_generation FROM state WHERE singleton=1",

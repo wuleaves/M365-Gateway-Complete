@@ -1,6 +1,6 @@
 # M365 Gateway 完整包
 
-版本：`0.2.1`
+版本：`0.2.2`
 部署形态：Cloudflare Workers，或 Node.js/Docker 独立服务器；均可搭配固定目标 Go 出口 Relay
 
 本完整包以 `M365-Gateway-Cloudflare-UI-Mobile-20260917-r9` 为主线，合并了此前各源码包中仍被当前实现引用但在 r9 压缩包中漏装的可选 Go 出口 Relay，并保留 Cloudflare、Node/Docker、MFA、现代化管理界面与完整测试。
@@ -128,6 +128,12 @@ Codex 的 Responses 续接允许省略重复的固定调用方工具声明（`ex
 ### 0.2.1 管理与统计优化
 
 图片端点仅接受省略 `model` 或指定 `m365-image`，传入聊天模型会返回明确的 `invalid_image_model`。管理页的请求趋势现从 Durable Object 的有界分钟统计生成，支持 24 小时和 7 天视图，并遵循页面所选时区；趋势从升级后开始记录，不回填旧版抽样明细。新增 `/api/admin/usage/trend?days=1|7&timezone=Asia/Shanghai`。仪表盘另有账号、密钥、会话和诊断快捷入口。上游 503 现在单独标记为服务过载。
+
+### 0.2.2 会话与清理加固
+
+云端对话清理会检查最近 30 天的本地会话绑定，跳过仍被引用的对话；缺少最后活动时间的云端记录也会跳过，以免仅凭创建时间删除仍在使用的对话。清理结果增加 `protected` 和 `skippedUnknownActivity` 计数。已登记的显式会话现在可在管理页列出并逐个重置；未登记的临时会话不列入该表。管理员 API 新增 `/api/admin/sessions`、`/api/admin/sessions/reset` 和 `/api/admin/usage/reuse`。复用命中率只统计成功请求中真实续接的已提交会话，不估算节省 Token。
+
+分钟趋势改为在同一个累计统计行内滚动更新，仅跨分钟时归档上一分钟，减少持续流量中的 SQLite 写入次数。当前分钟会直接加入趋势查询，因此图表仍可实时更新。
 
 ## 本地验证
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2 — 2026-10-01
+
+- Protected recent client-bound cloud conversations during administrator cleanup and deletion. Conversations without a reliable last-activity timestamp are skipped instead of being deleted by creation age alone.
+- Added an administrator list/reset UI for registered explicit sessions; reset refuses active sessions.
+- Counted successful committed-session reuse and first-use requests exactly, without claiming estimated token savings.
+- Rolled current-minute usage into the existing totals row and archived it only on minute change, eliminating the extra per-request trend-row write.
+- Added focused cleanup and Durable Object accounting tests.
+
 ## 0.2.1 — 2026-10-01
 
 - Validated the requested model on image generation, edit and variation routes; only `m365-image` is accepted, so unsupported chat models can no longer be silently substituted.

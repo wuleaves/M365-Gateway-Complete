@@ -19,6 +19,7 @@ import {
   listCloudConversations,
   memoryService,
   pluginService,
+  protectedCloudConversationIDs,
   type MicrosoftServiceResult,
 } from "./m365-services";
 
@@ -98,6 +99,7 @@ function serviceFailure(cause: unknown): Response {
   if (code === "NO_HEALTHY_ACCOUNT") return error(503, "account_unavailable", "no healthy Microsoft 365 account is available");
   if (code === "SERVICE_RESPONSE_TOO_LARGE") return error(502, "upstream_payload_too_large", "Microsoft 365 service response exceeded the gateway limit");
   if (code === "SERVICE_INVALID_RESPONSE") return error(502, "upstream_response_error", "Microsoft 365 service returned invalid JSON");
+  if (code === "CLOUD_CLEANUP_REGISTRY_TOO_LARGE") return error(409, "cleanup_protection_unavailable", "too many active session bindings to verify safely");
   if (code === "MICROSOFT_REFRESH_TOKEN_REJECTED" || code === "MICROSOFT_REFRESH_TOKEN_MISSING") {
     return error(409, "account_reauthorization_required", "Microsoft 365 authorization must be renewed for this feature");
   }
@@ -406,6 +408,22 @@ async function adminRoute(request: Request, env: Env, url: URL): Promise<Respons
     const limit = Number.parseInt(url.searchParams.get("limit") ?? "500", 10);
     return json({ totals: await state.statsSnapshot(), dimensions: await state.usageDimensionStats(limit) });
   }
+  if (url.pathname === "/api/admin/usage/reuse" && request.method === "GET") {
+    return json(await state.sessionReuseStats());
+  }
+  if (url.pathname === "/api/admin/sessions" && request.method === "GET") {
+    return json({ sessions: await state.listAdminSessions() });
+  }
+  if (url.pathname === "/api/admin/sessions/reset" && request.method === "POST") {
+    const input = await jsonBody<{ apiKeyId?: string; id?: string }>(request);
+    if (typeof input.apiKeyId !== "string" || typeof input.id !== "string") return error(400, "invalid_session_key", "session key and API key id are required");
+    const objectKey = await state.adminSessionObjectKey(input.apiKeyId, input.id);
+    if (!objectKey) return error(404, "session_not_found", "registered session not found");
+    const status = await env.CHATS.getByName(objectKey).reset();
+    if (status === "busy") return error(409, "conversation_busy", "session currently has an active request");
+    await state.deleteSessionRegistration(input.apiKeyId, input.id);
+    return json({ status, deleted: true });
+  }
   if (url.pathname === "/api/admin/usage/trend" && request.method === "GET") {
     const days = Number(url.searchParams.get("days") ?? "1");
     const timeZone = url.searchParams.get("timezone") ?? "UTC";
@@ -597,13 +615,18 @@ async function serviceRoute(request: Request, env: Env, url: URL): Promise<Respo
       const access = await admin(request, env);
       if (!access.ok) return access.response;
       const input = await jsonBody<{ conversation_id?: string }>(request);
+      const selected = await listCloudConversations(env);
+      if (selected.status < 200 || selected.status >= 300) return serviceResponse(selected);
+      if (await protectedCloudConversationIDs(env, selected.accountId).then((ids) => ids.has(input.conversation_id ?? ""))) {
+        return error(409, "conversation_in_use", "this cloud conversation is bound to an active client session");
+      }
       return serviceResponse(await deleteCloudConversation(env, input.conversation_id ?? ""));
     }
     if (url.pathname === "/api/conversations/cleanup" && request.method === "POST") {
       const access = await admin(request, env);
       if (!access.ok) return access.response;
       const input = await jsonBody<{ max_age_days?: number; keep_latest?: number }>(request);
-      const maxAgeDays = Number.isFinite(input.max_age_days) ? Math.max(0, Math.min(3_650, Math.trunc(input.max_age_days!))) : 30;
+      const maxAgeDays = Number.isFinite(input.max_age_days) ? Math.max(1, Math.min(3_650, Math.trunc(input.max_age_days!))) : 30;
       const keepLatest = Number.isFinite(input.keep_latest) ? Math.max(0, Math.min(500, Math.trunc(input.keep_latest!))) : 20;
       return json(await cleanupCloudConversations(env, maxAgeDays, keepLatest));
     }
