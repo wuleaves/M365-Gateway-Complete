@@ -20,7 +20,7 @@ import {
   mayFailOverChatHubFailure,
   preserveChatHubSubmissionHistory,
 } from "../src/chathub";
-import { adoptToolRouterResult, appendPortableProtocolTurn, assistantVisibleText, boundPublicExecFunctionCall, chatPrompt, compactCodeModeDescription, compactPortableTaskTail, compactRetainedMessages, containsClientToolProtocolResidue, containsStructuralClientToolProtocolResidue, continuationCallerToolsFromLease, deterministicToolRouterRecovery, effectiveDirectToolChoice, escapePromptProtocolText, freshToolResultContinuationPrompt, guardAssistantCompletion, hasFreshCallerLocalContinuationEvidence, hasFreshCallerLocalFailureEvidence, hasPortableAccountRecovery, hydrateLeaseFromCompaction, isCallerLocalExecRefusal, latestPairedFunctionOutputCallId, normalizeResponsesCustomToolInput, observeStreamBackpressure, omitRecoveredPendingProposals, parseToolRouterDecision, portableAssistantResult, portableTurnLooksComplete, preferredSecondAttemptLocalToolName, publicCheckpointMetadata, publicFailure, recoverRepeatedPendingProposal, repairFunctionCallTaskAnchors, responseFunctionCallEvents, responsesInstructionsPrefix, responsesLiteCustomTools, responsesPrompt, responsesTemporarySession, restorePortableProtocolPrompt, responsesContinuationOutputIssue, sanitizePortableProtocolText, selectActiveResponsesInput, shouldAuditCallerLocalContinuation, shouldBufferToolStream, shouldForceDirectNativeToolChoice, shouldRecoverCallerLocalExecRefusal, shouldRecoverFableLocalExecRefusal, shouldRestoreChatPortableCheckpoint, shouldRestorePortableTaskFollowup, shouldRetryAccountRouteChanged, streamTextSuffix, toolRouterPrompt, validateResponsesMetadata } from "../src/openai";
+import { adoptToolRouterResult, appendPortableProtocolTurn, assistantVisibleText, boundPublicExecFunctionCall, chatPrompt, compactCodeModeDescription, compactPortableTaskTail, compactRetainedMessages, containsClientToolProtocolResidue, containsStructuralClientToolProtocolResidue, continuationCallerToolsFromLease, deterministicToolRouterRecovery, effectiveDirectToolChoice, escapePromptProtocolText, freshToolResultContinuationPrompt, guardAssistantCompletion, hasFreshCallerLocalContinuationEvidence, hasFreshCallerLocalFailureEvidence, hasPortableAccountRecovery, hydrateLeaseFromCompaction, isCallerLocalExecRefusal, latestPairedFunctionOutputCallId, normalizeResponsesCustomToolInput, observeStreamBackpressure, omitRecoveredPendingProposals, parseToolRouterDecision, portableAssistantResult, portableTurnLooksComplete, preferredSecondAttemptLocalToolName, publicCheckpointMetadata, publicFailure, recoverRepeatedPendingProposal, repairFunctionCallTaskAnchors, responseFunctionCallEvents, responsesInstructionsPrefix, responsesLiteCustomTools, responsesPrompt, responsesTemporarySession, restorePortableProtocolPrompt, responsesContinuationOutputIssue, sanitizePortableProtocolText, selectActiveResponsesInput, shouldAuditCallerLocalContinuation, shouldBufferToolStream, shouldForceDirectNativeToolChoice, shouldRecoverCallerLocalExecRefusal, shouldRecoverFableLocalExecRefusal, shouldRestoreChatPortableCheckpoint, shouldRestorePortableTaskFollowup, shouldRetryAccountRouteChanged, streamTextSuffix, toolRouterPrompt, validateImageModel, validateResponsesMetadata } from "../src/openai";
 import { RequestMetricTracker } from "../src/request-metrics";
 import { validateToolArguments } from "../src/tool-schema";
 import { DEFAULT_MAX_TOOL_ROUNDS, completedEvidenceContext, completedToolSnapshots, guardProposedToolCalls, parseChatCompletionEvidenceLedger, parseChatToolLedger, parseResponsesToolLedger } from "../src/tool-ledger";
@@ -30,6 +30,16 @@ import { boundedPortableProtocolSuffix } from "../src/chat-session";
 import { normalizeMultimodalContent, MultimodalInputError } from "../src/multimodal";
 
 describe("model catalog and ChatHub tones", () => {
+  it("rejects chat models on image routes instead of silently replacing them", () => {
+    expect(() => validateImageModel(undefined)).not.toThrow();
+    expect(() => validateImageModel("m365-image")).not.toThrow();
+    expect(() => validateImageModel("gpt-5.6-sol")).toThrow("INVALID_IMAGE_MODEL");
+    expect(() => validateImageModel(null)).toThrow("INVALID_IMAGE_MODEL");
+  });
+  it("reports upstream overload separately from connectivity failures", () => {
+    expect(publicFailure(new Error("WS_DIAL_FAILED:503")).code).toBe("upstream_overloaded");
+    expect(publicFailure(new Error("WS_DIAL_ERROR")).code).toBe("upstream_connect_error");
+  });
   it("accepts the newly exposed Copilot model aliases", () => {
     expect(canonicalModel("gpt-5.6-think-deeper")).toBe("gpt-5.6-reasoning");
     expect(canonicalModel(" GPT-6-ASTRA ")).toBe("gpt-6-astra");

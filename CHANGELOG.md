@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 — 2026-10-01
+
+- Validated the requested model on image generation, edit and variation routes; only `m365-image` is accepted, so unsupported chat models can no longer be silently substituted.
+- Added a bounded seven-day minute usage series and timezone-aware `/api/admin/usage/trend` aggregation. The 24-hour view switches between minute and hour buckets, while the seven-day view uses local calendar days.
+- Replaced the admin dashboard's static traffic illustration with a real usage trend and added account, key, session and diagnostic quick actions.
+- Distinguished Microsoft ChatHub upstream 503 overload from local connection failures while retaining account failover behavior.
+- Reviewed M365-Copilot2API `056c028` and adapted the Cloudflare-compatible behavior independently; process-level WebSocket prewarming remains outside the Worker lifecycle.
+
 ## 0.2.0 — 2026-09-30
 
 - Independently reimplemented the portable M365-Copilot2API compatibility set for the Cloudflare-native architecture.

@@ -1,6 +1,6 @@
 # M365 Gateway 完整包
 
-版本：`0.2.0`
+版本：`0.2.1`
 部署形态：Cloudflare Workers，或 Node.js/Docker 独立服务器；均可搭配固定目标 Go 出口 Relay
 
 本完整包以 `M365-Gateway-Cloudflare-UI-Mobile-20260917-r9` 为主线，合并了此前各源码包中仍被当前实现引用但在 r9 压缩包中漏装的可选 Go 出口 Relay，并保留 Cloudflare、Node/Docker、MFA、现代化管理界面与完整测试。
@@ -124,6 +124,10 @@ Codex 的 Responses 续接允许省略重复的固定调用方工具声明（`ex
 - `/api/admin/egress/check` 只检查预配置的固定 Relay，不暴露 URL/HMAC，不开放任意代理。
 
 `M365_FORCE_IPV4`、本地通用代理池、桌面自动启动、本地进程热加载、文件系统自更新、API Key 明文回读和完整上游正文日志不属于 Cloudflare Worker 安全可移植集，因此仍未加入。
+
+### 0.2.1 管理与统计优化
+
+图片端点仅接受省略 `model` 或指定 `m365-image`，传入聊天模型会返回明确的 `invalid_image_model`。管理页的请求趋势现从 Durable Object 的有界分钟统计生成，支持 24 小时和 7 天视图，并遵循页面所选时区；趋势从升级后开始记录，不回填旧版抽样明细。新增 `/api/admin/usage/trend?days=1|7&timezone=Asia/Shanghai`。仪表盘另有账号、密钥、会话和诊断快捷入口。上游 503 现在单独标记为服务过载。
 
 ## 本地验证
 

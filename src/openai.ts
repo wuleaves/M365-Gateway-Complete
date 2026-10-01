@@ -1458,6 +1458,7 @@ export function publicFailure(cause: unknown): { code: string; message: string }
   if (raw === "CHAT_UPSTREAM_RATE_LIMITED") return { code: "upstream_rate_limit", message: "Microsoft ChatHub is temporarily rate-limited; retry later" };
   if (raw === "CHAT_DISENGAGED") return { code: "upstream_disengaged", message: "Microsoft ChatHub disengaged from this turn; wait briefly and retry with a smaller or simpler request" };
   if (raw === "SESSION_ACCOUNT_ISOLATED" || raw === "SESSION_ACCOUNT_MISSING") return { code: "session_account_unavailable", message: "the account bound to this conversation is unavailable" };
+  if (raw === "WS_DIAL_FAILED:503") return { code: "upstream_overloaded", message: "Microsoft ChatHub is temporarily overloaded; retry later" };
   if (raw.startsWith("WS_DIAL_FAILED:") || raw === "WS_DIAL_ERROR") return { code: "upstream_connect_error", message: "failed to connect to Microsoft ChatHub" };
   if (raw.startsWith("RELAY_DIAL_FAILED:") || raw === "RELAY_DIAL_ERROR") return { code: "upstream_relay_error", message: "the configured egress relay could not connect to Microsoft ChatHub" };
   if (raw.startsWith("WS_HANDSHAKE_")) return { code: "upstream_connect_error", message: "Microsoft ChatHub rejected or returned an invalid realtime handshake" };
@@ -7854,7 +7855,8 @@ async function imageGeneration(
   let responseFormat = "url";
   let content: unknown;
   if (url.pathname === "/v1/images/generations") {
-    const input = await body<{ prompt?: unknown; n?: unknown; response_format?: unknown }>(request);
+    const input = await body<{ prompt?: unknown; n?: unknown; response_format?: unknown; model?: unknown }>(request);
+    validateImageModel(input.model);
     prompt = boundedImagePrompt(input.prompt, "");
     count = boundedImageCount(input.n);
     responseFormat = typeof input.response_format === "string" ? input.response_format : "url";
@@ -7864,6 +7866,8 @@ async function imageGeneration(
     prompt = boundedImagePrompt(form.get("prompt"));
     count = boundedImageCount(form.get("n") ?? 1);
     responseFormat = typeof form.get("response_format") === "string" ? String(form.get("response_format")) : "url";
+    const model = form.get("model");
+    validateImageModel(model ?? undefined);
     const parts: Record<string, unknown>[] = [{ type: "text", text: `${prompt}\n\nReturn exactly ${count} image${count === 1 ? "" : "s"}.` }];
     const images = [...form.getAll("image"), ...form.getAll("mask")].slice(0, 4);
     if (images.length === 0) throw new Error("INVALID_IMAGE_REQUEST");
@@ -7902,6 +7906,10 @@ async function imageGeneration(
   return Response.json({ created: Math.floor(Date.now() / 1_000), data });
 }
 
+export function validateImageModel(model: unknown): void {
+  if (model !== undefined && model !== "m365-image") throw new Error("INVALID_IMAGE_MODEL");
+}
+
 export async function openAIRequest(
   request: Request,
   env: Env,
@@ -7931,6 +7939,7 @@ export async function openAIRequest(
     const code = cause instanceof Error ? cause.message : "REQUEST_FAILED";
     if (code === "EMPTY_PROMPT") return apiError(400, "invalid_request_error", "a non-empty prompt is required");
     if (code === "INVALID_IMAGE_REQUEST") return apiError(400, "invalid_image_request", "image request fields or multipart image data are invalid");
+    if (code === "INVALID_IMAGE_MODEL") return apiError(400, "invalid_image_model", "image requests support only m365-image");
     if (code === "IMAGE_B64_UNAVAILABLE") return apiError(400, "image_response_format_unsupported", "b64_json is available only when Microsoft 365 returns an inline image");
     if (code === "INVALID_JSON") return apiError(400, "invalid_json", "request body must be valid JSON");
     if (code === "INVALID_REQUEST" || code === "INVALID_INSTRUCTIONS") return apiError(400, "invalid_request_error", "request body does not match the selected endpoint");
@@ -7963,6 +7972,7 @@ export async function openAIRequest(
     if (code === "ACCOUNT_QUEUE_TIMEOUT") return apiError(429, "account_busy", "the Microsoft 365 account is busy; retry later");
     if (code === "CHAT_THROTTLED_QUOTA_EXHAUSTED") return apiError(429, "upstream_throttled", "the selected Microsoft 365 account has exhausted its current allowance");
     if (code === "CHAT_UPSTREAM_RATE_LIMITED") return apiError(429, "upstream_rate_limit", "Microsoft ChatHub is temporarily rate-limited; retry later");
+    if (code === "WS_DIAL_FAILED:503") return apiError(503, "upstream_overloaded", "Microsoft ChatHub is temporarily overloaded; retry later");
     if (code === "UNSUPPORTED_MODEL") return apiError(400, "unsupported_model", "the requested model is not supported by this gateway");
     if (code === "TOOL_DECISION_INVALID") return apiError(502, "tool_decision_invalid", "Microsoft 365 returned a malformed tool decision");
     if (code === "TOOL_CALL_GENERATION_FAILED") return apiError(502, "tool_call_generation_failed", "the model did not produce a valid required function call after bounded repair");

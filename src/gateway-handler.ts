@@ -9,6 +9,7 @@ import {
 } from "./migration";
 import { readJSONLimited } from "./request-body";
 import { RequestMetricTracker, shouldRetainRequestObservation, trackBufferedResponse, trackStreamingResponse } from "./request-metrics";
+import { validTrendTimeZone } from "./usage-trend";
 import { MAX_API_KEY_NAME_CHARACTERS, MAX_API_KEY_VALIDITY_DAYS, TenantState } from "./tenant-state";
 import type { Env, RequestMetricInput } from "./types";
 import type { APIKeyAuthorization } from "./tenant-state";
@@ -404,6 +405,12 @@ async function adminRoute(request: Request, env: Env, url: URL): Promise<Respons
   if (url.pathname === "/api/admin/usage" && request.method === "GET") {
     const limit = Number.parseInt(url.searchParams.get("limit") ?? "500", 10);
     return json({ totals: await state.statsSnapshot(), dimensions: await state.usageDimensionStats(limit) });
+  }
+  if (url.pathname === "/api/admin/usage/trend" && request.method === "GET") {
+    const days = Number(url.searchParams.get("days") ?? "1");
+    const timeZone = url.searchParams.get("timezone") ?? "UTC";
+    if ((days !== 1 && days !== 7) || !validTrendTimeZone(timeZone)) return error(400, "invalid_usage_trend", "days must be 1 or 7 and timezone must be a valid IANA time zone");
+    return json(await state.usageTrend(days, timeZone));
   }
   if (url.pathname === "/api/admin/reset-stats" && request.method === "POST") {
     return json({ status: "reset", ...(await state.resetRequestStats()) });

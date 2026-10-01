@@ -5,6 +5,7 @@ import { refreshToken, scopedAccessToken, type ScopedAccessToken } from "./oauth
 import { parsePasskeyRegistration, randomChallenge, verifyPasskeyAssertion, verifyTOTP } from "./mfa";
 import type { MigratedAccountInput } from "./migration";
 import { normalizeRuntimeModelConfiguration, type RuntimeModelConfiguration } from "./models";
+import { aggregateUsageTrend, type UsageTrendRow } from "./usage-trend";
 import type {
   AccountEgress,
   DiagnosticInput,
@@ -231,6 +232,7 @@ function safeDiagnosticIdentifier(value: string, maximum: number, fallback = "re
 
 export class TenantState extends DurableObject<Env> {
   private metricWritesSincePrune = 0;
+  private usageWritesSincePrune = 0;
   private diagnosticWritesSincePrune = 0;
   private readonly refreshInFlight = new Map<string, Promise<OAuthTokenSet>>();
   private readonly credentialMirrorInFlight = new Map<string, Promise<void>>();
@@ -381,6 +383,13 @@ export class TenantState extends DurableObject<Env> {
         http_status INTEGER NOT NULL DEFAULT 0,
         semantic_status TEXT NOT NULL DEFAULT 'complete',
         duration_ms INTEGER NOT NULL DEFAULT 0,
+        token_in INTEGER NOT NULL DEFAULT 0,
+        token_out INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS request_usage_minutes (
+        minute INTEGER PRIMARY KEY,
+        requests INTEGER NOT NULL DEFAULT 0,
+        errors INTEGER NOT NULL DEFAULT 0,
         token_in INTEGER NOT NULL DEFAULT 0,
         token_out INTEGER NOT NULL DEFAULT 0
       );
@@ -1185,6 +1194,7 @@ export class TenantState extends DurableObject<Env> {
     const tokenOut = boundedInteger(input.tokenOut, MAX_METRIC_TOKENS);
     let acceptedMetric = !retainDetail;
     const nextMetricPruneCount = this.metricWritesSincePrune + 1;
+    const nextUsagePruneCount = this.usageWritesSincePrune + 1;
     const pruneMetrics = retainDetail && nextMetricPruneCount >= METRIC_PRUNE_INTERVAL;
     this.ctx.storage.transactionSync(() => {
       if (retainDetail) {
@@ -1211,6 +1221,16 @@ export class TenantState extends DurableObject<Env> {
         tokenIn,
         tokenOut,
         now,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO request_usage_minutes(minute,requests,errors,token_in,token_out)
+         VALUES(?,1,?,?,?) ON CONFLICT(minute) DO UPDATE SET
+         requests=requests+1,errors=errors+excluded.errors,
+         token_in=token_in+excluded.token_in,token_out=token_out+excluded.token_out`,
+        Math.floor(now / 60_000) * 60_000,
+        errorCount,
+        tokenIn,
+        tokenOut,
       );
       if (accountId) {
         this.ctx.storage.sql.exec(
@@ -1249,8 +1269,12 @@ export class TenantState extends DurableObject<Env> {
           MAX_RECORDED_REQUEST_IDS,
         );
       }
+      if (nextUsagePruneCount >= 256) {
+        this.ctx.storage.sql.exec("DELETE FROM request_usage_minutes WHERE minute<?", now - 7 * 24 * 60 * 60_000);
+      }
     });
     if (retainDetail && acceptedMetric) this.metricWritesSincePrune = pruneMetrics ? 0 : nextMetricPruneCount;
+    if (acceptedMetric) this.usageWritesSincePrune = nextUsagePruneCount >= 256 ? 0 : nextUsagePruneCount;
     return acceptedMetric;
   }
 
@@ -1340,6 +1364,20 @@ export class TenantState extends DurableObject<Env> {
     }));
   }
 
+  async usageTrend(days: 1 | 7, timeZone: string): Promise<ReturnType<typeof aggregateUsageTrend> & { days: number; timeZone: string; availableSince: string | null }> {
+    const cutoff = Date.now() - days * 24 * 60 * 60_000;
+    const rows = this.ctx.storage.sql.exec<{ minute: number; requests: number; errors: number; token_in: number; token_out: number }>(
+      days === 7
+        ? `SELECT CAST(minute / 900000 AS INTEGER) * 900000 AS minute,
+                  SUM(requests) AS requests,SUM(errors) AS errors,SUM(token_in) AS token_in,SUM(token_out) AS token_out
+           FROM request_usage_minutes WHERE minute>=? GROUP BY CAST(minute / 900000 AS INTEGER) ORDER BY minute`
+        : `SELECT minute,requests,errors,token_in,token_out FROM request_usage_minutes WHERE minute>=? ORDER BY minute`,
+      cutoff,
+    ).toArray();
+    const data: UsageTrendRow[] = rows.map((row) => ({ minute: row.minute, requests: row.requests, errors: row.errors, tokenIn: row.token_in, tokenOut: row.token_out }));
+    return { days, timeZone, availableSince: data.length ? new Date(data[0].minute).toISOString() : null, ...aggregateUsageTrend(data, days, timeZone) };
+  }
+
   async resetRequestStats(): Promise<GatewayStats> {
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
@@ -1347,6 +1385,7 @@ export class TenantState extends DurableObject<Env> {
       );
       this.ctx.storage.sql.exec("DELETE FROM account_request_stats");
       this.ctx.storage.sql.exec("DELETE FROM recorded_request_metrics");
+      this.ctx.storage.sql.exec("DELETE FROM request_usage_minutes");
       this.ctx.storage.sql.exec("DELETE FROM request_dimension_stats");
     });
     return this.statsSnapshot();

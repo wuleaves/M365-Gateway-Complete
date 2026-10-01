@@ -1370,9 +1370,12 @@
             <div class="card-title-bar">
               <div class="card-heading">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
-                <span>网关吞吐轨迹示意 (Traffic Pulse)</span>
+                <span>网关请求趋势</span>
               </div>
-              <span class="badge-glass badge-blue">STATIC PREVIEW</span>
+              <div style="display:flex;gap:6px">
+                <button class="btn btn-glass btn-sm" id="trendOneDay" type="button">24 小时</button>
+                <button class="btn btn-glass btn-sm" id="trendSevenDays" type="button">7 天</button>
+              </div>
             </div>
             
             <div class="chart-container-glass">
@@ -1387,19 +1390,25 @@
                 <line x1="0" y1="80" x2="600" y2="80" stroke="var(--table-border)" stroke-dasharray="4 4" />
                 <line x1="0" y1="120" x2="600" y2="120" stroke="var(--table-border)" stroke-dasharray="4 4" />
                 
-                <path d="M 0 130 C 50 120, 100 80, 150 95 C 200 110, 250 50, 300 65 C 350 80, 400 30, 450 45 C 500 60, 550 20, 600 35 L 600 160 L 0 160 Z" fill="url(#waveGrad)" />
-                <path d="M 0 130 C 50 120, 100 80, 150 95 C 200 110, 250 50, 300 65 C 350 80, 400 30, 450 45 C 500 60, 550 20, 600 35" fill="none" stroke="var(--accent-cyan)" stroke-width="2.8" stroke-linecap="round" />
-                
-                <circle cx="450" cy="45" r="4.5" fill="var(--accent-cyan)" stroke="var(--bg-color)" stroke-width="2" />
-                <circle cx="600" cy="35" r="5" fill="var(--accent-emerald)" stroke="var(--bg-color)" stroke-width="2" />
+                <path id="trendFill" fill="url(#waveGrad)" />
+                <path id="trendLine" fill="none" stroke="var(--accent-cyan)" stroke-width="2.8" stroke-linecap="round" />
+                <circle id="trendDot" cx="300" cy="145" r="4" fill="var(--accent-cyan)" style="display:none" />
               </svg>
             </div>
             
             <div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--text-dim);margin-top:10px">
-              <span>&bull; 图形仅作界面示意，并非实时或历史监控数据</span>
-              <span>实际状态请以上方持久化累计指标为准</span>
+              <span id="trendSummary">正在读取趋势数据…</span>
+              <span id="trendRange">统计从升级后开始，按所选时区显示</span>
             </div>
           </div>
+        </div>
+
+        <div class="glass-panel" style="padding:18px 24px;margin-bottom:22px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span style="font-size:12px;color:var(--text-dim);margin-right:8px">快捷操作</span>
+          <button class="btn btn-glass btn-sm" type="button" onclick="openModal('modalOAuthWizard')">添加微软账号</button>
+          <button class="btn btn-glass btn-sm" type="button" onclick="switchView('keys')">创建 API 密钥</button>
+          <button class="btn btn-glass btn-sm" type="button" onclick="switchView('sessions')">查看会话</button>
+          <button class="btn btn-glass btn-sm" type="button" onclick="switchView('diagnostics')">查看近期请求</button>
         </div>
 
         <!-- 第三行：快捷状态面板 -->
@@ -1963,6 +1972,7 @@
       let settingsState = null;
       let logsState = [];
       let countdownInterval = null;
+      let trendDays = 1;
 
       // ==========================================================================
       // 天体昼夜动力学与动态光影引擎 (Sun & Moon Astronomical Orbit Engine)
@@ -2063,6 +2073,7 @@
         localStorage.setItem(UI_PREFERENCE_KEY, JSON.stringify(uiPreferences));
         document.getElementById("uiPreferenceStatus").textContent = `已保存：${uiPreferences.timezone === "system" ? "系统时区" : uiPreferences.timezone} · ${uiPreferences.theme === "system" ? "系统显示模式" : uiPreferences.theme === "day" ? "白天" : "夜晚"}`;
         updateCelestialOrbit();
+        loadTrend();
       }
 
       syncUiPreferenceControls();
@@ -2143,6 +2154,52 @@
         if (n >= 1_000) return (n / 1_000).toFixed(1) + " K";
         return String(n);
       }
+
+      async function loadTrend() {
+        const summary = document.getElementById("trendSummary");
+        const line = document.getElementById("trendLine");
+        const fill = document.getElementById("trendFill");
+        const dot = document.getElementById("trendDot");
+        const zone = selectedTimeZone() || "UTC";
+        document.getElementById("trendOneDay")?.setAttribute("aria-pressed", String(trendDays === 1));
+        document.getElementById("trendSevenDays")?.setAttribute("aria-pressed", String(trendDays === 7));
+        try {
+          const response = await fetch(`/api/admin/usage/trend?days=${trendDays}&timezone=${encodeURIComponent(zone)}`);
+          if (!response.ok) throw new Error("趋势数据暂不可用");
+          const data = await response.json();
+          const points = data.points || [];
+          if (!points.length) {
+            line.setAttribute("d", "");
+            fill.setAttribute("d", "");
+            dot.style.display = "none";
+            summary.textContent = "暂无请求记录";
+            document.getElementById("trendRange").textContent = `按 ${zone} 显示 · 新数据从本次升级后开始`;
+            return;
+          }
+          const maximum = Math.max(1, ...points.map((point) => point.requests));
+          const path = points.map((point, index) => {
+            const x = points.length === 1 ? 300 : index * 600 / (points.length - 1);
+            const y = 145 - point.requests / maximum * 125;
+            return `${index ? "L" : "M"} ${x.toFixed(2)} ${y.toFixed(2)}`;
+          }).join(" ");
+          line.setAttribute("d", path);
+          fill.setAttribute("d", `${path} L ${points.length === 1 ? 300 : 600} 160 L ${points.length === 1 ? 300 : 0} 160 Z`);
+          dot.style.display = points.length === 1 ? "" : "none";
+          if (points.length === 1) dot.setAttribute("cy", String(145 - points[0].requests / maximum * 125));
+          const requests = points.reduce((sum, point) => sum + point.requests, 0);
+          const tokens = points.reduce((sum, point) => sum + point.tokenIn + point.tokenOut, 0);
+          summary.textContent = `${numStr(requests)} 次请求 · ${tokenStr(tokens)} Token`;
+          document.getElementById("trendRange").textContent = `${points[0].key} → ${points.at(-1).key} · ${zone}`;
+        } catch (error) {
+          line.setAttribute("d", "");
+          fill.setAttribute("d", "");
+          dot.style.display = "none";
+          summary.textContent = error.message || "趋势数据暂不可用";
+        }
+      }
+
+      document.getElementById("trendOneDay")?.addEventListener("click", () => { trendDays = 1; loadTrend(); });
+      document.getElementById("trendSevenDays")?.addEventListener("click", () => { trendDays = 7; loadTrend(); });
 
       function relTime(ts) {
         if (!ts) return "无最近调用";
@@ -2714,6 +2771,7 @@
         button.disabled = true;
         const ok = await syncAccounts();
         await loadLogs();
+        await loadTrend();
         if (ok) toast("账号和诊断数据已同步", "success");
         button.disabled = false;
       });
@@ -2754,13 +2812,16 @@
             window.location.replace("/login");
             return;
           }
-          await Promise.all([syncHealth(), syncAccounts(), loadLogs(), loadPasskeys()]);
+          await Promise.all([syncHealth(), syncAccounts(), loadLogs(), loadPasskeys(), loadTrend()]);
         } catch {
           window.location.replace("/login");
         }
       }
 
       initialize();
+      setInterval(() => {
+        if (document.getElementById("view-dashboard")?.classList.contains("active")) loadTrend();
+      }, 60_000);
     })();
   </script>
 </body>
