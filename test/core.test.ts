@@ -33,6 +33,8 @@ describe("model catalog and ChatHub tones", () => {
   it("rejects chat models on image routes instead of silently replacing them", () => {
     expect(() => validateImageModel(undefined)).not.toThrow();
     expect(() => validateImageModel("m365-image")).not.toThrow();
+    expect(() => validateImageModel("flux-3")).not.toThrow();
+    expect(() => validateImageModel("flux-4")).not.toThrow();
     expect(() => validateImageModel("gpt-5.6-sol")).toThrow("INVALID_IMAGE_MODEL");
     expect(() => validateImageModel(null)).toThrow("INVALID_IMAGE_MODEL");
   });
@@ -76,23 +78,20 @@ describe("model catalog and ChatHub tones", () => {
   it("advertises verified and explicitly tenant-dependent routes", () => {
     const ids = modelCatalog().map((model) => model.id);
     expect(ids).toEqual([
-      "m365-image",
-      "gpt-5.2", "gpt-5.2-reasoning", "gpt-5.3", "gpt-5.3-reasoning",
+      "gpt-5.2", "gpt-5.2-reasoning", "gpt-5.3",
       "gpt-5.4", "gpt-5.4-reasoning", "gpt-5.5", "gpt-5.5-reasoning",
-      "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-reasoning",
-      "gpt-6-astra",
+      "gpt-5.6-reasoning", "flux-3", "flux-4",
       "claude-sonnet", "claude-sonnet-reasoning",
     ]);
     expect(ids.some((id) => /(?:quick|opus|fable)/iu.test(id))).toBe(false);
     expect(modelCatalog().filter((model) => model.x_m365_availability === "tenant_dependent").map((model) => model.id)).toEqual([
-      "m365-image",
-      "gpt-5.2", "gpt-5.2-reasoning", "gpt-5.3", "gpt-5.3-reasoning",
-      "gpt-5.4", "gpt-5.4-reasoning", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra",
+      "gpt-5.2", "gpt-5.2-reasoning", "gpt-5.3",
+      "gpt-5.4", "gpt-5.4-reasoning", "flux-3", "flux-4",
     ]);
-    expect(modelCatalog().find((model) => model.id === "gpt-6-astra")).toMatchObject({
+    expect(modelCatalog().find((model) => model.id === "flux-3")).toMatchObject({
       owned_by: "microsoft-365",
       x_m365_availability: "tenant_dependent",
-      capabilities: { chat_completions: true, responses: true, vision: false, image_generation: false },
+      capabilities: { chat_completions: false, responses: false, image_generation: true },
       x_m365_reasoning: { summaries: false },
     });
   });
@@ -113,7 +112,7 @@ describe("model catalog and ChatHub tones", () => {
   it("exposes consistent reasoning selection and only live-verified public summary capability", () => {
     for (const model of modelCatalog()) {
       const codex = codexModelCatalog().models.find((entry) => entry.slug === model.id);
-      if (model.id === "m365-image") {
+      if (model.id === "flux-3" || model.id === "flux-4") {
         expect(codex).toBeUndefined();
         expect(model.capabilities).toMatchObject({ image_generation: true, chat_completions: false });
         continue;
@@ -129,10 +128,10 @@ describe("model catalog and ChatHub tones", () => {
 
   it("advertises direct tools without requiring an optional Code Mode Host", () => {
     const models = codexModelCatalog().models;
-    const sol = models.find((model) => model.slug === "gpt-5.6-sol");
+    const sol = models.find((model) => model.slug === "gpt-5.6-reasoning");
     const legacy = models.find((model) => model.slug === "gpt-5.5");
     expect(sol).toMatchObject({
-      default_reasoning_level: "low",
+      default_reasoning_level: "medium",
       use_responses_lite: false,
       tool_mode: "direct",
       input_modalities: ["text"],
@@ -149,14 +148,14 @@ describe("model catalog and ChatHub tones", () => {
   });
 
   it("keeps Responses Lite disabled for gateway models on current and legacy clients", () => {
-    const current = codexModelCatalog("0.153.2").models.find((model) => model.slug === "gpt-5.6-sol");
+    const current = codexModelCatalog("0.153.2").models.find((model) => model.slug === "gpt-5.6-reasoning");
     expect(current).toMatchObject({
       use_responses_lite: false,
       tool_mode: "direct",
     });
     expect(current).not.toHaveProperty("multi_agent_version");
 
-    const legacy = codexModelCatalog("0.151.0").models.find((model) => model.slug === "gpt-5.6-sol");
+    const legacy = codexModelCatalog("0.151.0").models.find((model) => model.slug === "gpt-5.6-reasoning");
     expect(legacy).toMatchObject({ use_responses_lite: false, tool_mode: "direct" });
     expect(legacy).not.toHaveProperty("multi_agent_version");
   });

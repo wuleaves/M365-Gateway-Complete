@@ -1,6 +1,6 @@
 # M365 Gateway 完整包
 
-版本：`0.2.2`
+版本：`0.2.3`
 部署形态：Cloudflare Workers，或 Node.js/Docker 独立服务器；均可搭配固定目标 Go 出口 Relay
 
 本完整包以 `M365-Gateway-Cloudflare-UI-Mobile-20260917-r9` 为主线，合并了此前各源码包中仍被当前实现引用但在 r9 压缩包中漏装的可选 Go 出口 Relay，并保留 Cloudflare、Node/Docker、MFA、现代化管理界面与完整测试。
@@ -98,10 +98,10 @@ Codex 的 Responses 续接允许省略重复的固定调用方工具声明（`ex
 
 当前模型目录分为两组：
 
-- 已验证稳定路由：`gpt-5.5`、`gpt-5.5-reasoning`、`gpt-5.6-sol`（`gpt-5.6` 别名）、`gpt-5.6-reasoning`、`claude-sonnet`、`claude-sonnet-reasoning`。
-- 租户依赖候选：`gpt-5.2`、`gpt-5.2-reasoning`、`gpt-5.3`、`gpt-5.3-reasoning`、`gpt-5.4`、`gpt-5.4-reasoning`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-6-astra`、`m365-image`。这些条目带 `x_m365_availability: tenant_dependent`，必须在实际租户中通过模型测试后才能视为可用。
+- 公开模型名称与上游 0.7.x 目录一致：`gpt-5.2`、`gpt-5.2-reasoning`、`gpt-5.3`、`gpt-5.4`、`gpt-5.4-reasoning`、`gpt-5.5`、`gpt-5.5-reasoning`、`gpt-5.6-reasoning`、`flux-3`、`flux-4`、`claude-sonnet`、`claude-sonnet-reasoning`。其中 GPT-5.2/5.3/5.4 与图片路由仍是租户依赖候选，必须在实际租户中测试。
+- `gpt-5.3-reasoning`、`gpt-5.6-sol/terra/luna`、`gpt-6-astra`、`m365-image` 是旧客户端兼容入口，不再出现在 `/v1/models` 或 Codex 模型清单；新配置请使用上游公开名称。兼容入口不是上游 0.7.x 的独立模型。
 
-文本模型保持原有声明。新增的 `m365-image` 是租户依赖的生图专用路由，只在标准 `/v1/models` 中声明 `image_generation: true`，不会进入 Codex 文本模型清单。`/v1/images/generations`、`/v1/images/edits` 和 `/v1/images/variations` 已接入有界请求预检与 Microsoft 生图路由；实际可用性仍取决于租户是否开通该功能。Chat/Responses 现在可以接收图片、文件和音频附件，并使用整个请求级的数量/大小限制与私网地址拒绝。Realtime 和实时语音仍未实现。
+`flux-3` 和 `flux-4` 是租户依赖的生图专用名称，只在标准 `/v1/models` 中声明 `image_generation: true`，不会进入 Codex 文本模型清单。两个名称当前都使用同一 Microsoft Magic/图片生成路由，并把选择的名称作为提示词的一部分传给上游；不能保证两者生成结果确实来自不同底层权重。`/v1/images/generations`、`/v1/images/edits` 和 `/v1/images/variations` 已接入有界请求预检；实际可用性仍取决于租户。Chat/Responses 可接收图片、文件和音频附件。Realtime 和实时语音仍未实现。
 
 `gpt-5.6-sol` 在未指定 reasoning effort 时使用低延迟 Chat 路由；需要更深推理时显式请求 `reasoning_effort=medium/high` 或使用 `gpt-5.6-reasoning`。未验证候选不会伪装成稳定能力。Microsoft 偶尔会用 HTTP 200 包装容量占位句，网关会将已识别的占位句转换为可重试的 429，避免把“无工具调用”的假成功交给 Codex/OpenCode。
 
@@ -134,6 +134,10 @@ Codex 的 Responses 续接允许省略重复的固定调用方工具声明（`ex
 云端对话清理会检查最近 30 天的本地会话绑定，跳过仍被引用的对话；缺少最后活动时间的云端记录也会跳过，以免仅凭创建时间删除仍在使用的对话。清理结果增加 `protected` 和 `skippedUnknownActivity` 计数。已登记的显式会话现在可在管理页列出并逐个重置；未登记的临时会话不列入该表。管理员 API 新增 `/api/admin/sessions`、`/api/admin/sessions/reset` 和 `/api/admin/usage/reuse`。复用命中率只统计成功请求中真实续接的已提交会话，不估算节省 Token。
 
 分钟趋势改为在同一个累计统计行内滚动更新，仅跨分钟时归档上一分钟，减少持续流量中的 SQLite 写入次数。当前分钟会直接加入趋势查询，因此图表仍可实时更新。
+
+### 0.2.3 模型名称对齐
+
+公开模型清单以 [M365-Copilot2API 上游目录](https://github.com/HEXUXIU/M365-Copilot2API/blob/main/internal/web/codex_catalog.go) 为准，移除非上游 0.7.x 公共名称；旧名称只用于请求兼容。图片端点默认 `flux-3`，也接受 `flux-4` 和旧名称 `m365-image`。图片模型均走 Microsoft Magic 路由，名称作为上游提示的一部分；实际底层权重和可用性仍由租户决定。此变更只更新代码和模型清单，不自动部署现有 Cloudflare 服务。
 
 ## 本地验证
 

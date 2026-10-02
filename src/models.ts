@@ -7,6 +7,7 @@ interface ModelSpec {
   availability?: "standard" | "tenant_dependent";
   tone?: string;
   reasoningTone?: string;
+  catalog?: false;
 }
 
 export interface RuntimeModelDefinition {
@@ -104,25 +105,27 @@ function allModels(): ModelSpec[] {
 }
 
 const MODELS: ModelSpec[] = [
-  { id: "m365-image", owner: "microsoft-365", contextWindow: 32_000, maxOutputTokens: 4_096, reasoning: false, availability: "tenant_dependent", tone: "Magic" },
+  { id: "m365-image", owner: "microsoft-365", contextWindow: 32_000, maxOutputTokens: 4_096, reasoning: false, availability: "tenant_dependent", tone: "Magic", catalog: false },
   // These GPT-5 routes are present in the Go gateway's maintained catalog.
   // They remain tenant-dependent until a live tenant successfully answers.
   { id: "gpt-5.2", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true, availability: "tenant_dependent" },
   { id: "gpt-5.2-reasoning", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true, availability: "tenant_dependent" },
   { id: "gpt-5.3", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true, availability: "tenant_dependent" },
-  { id: "gpt-5.3-reasoning", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true, availability: "tenant_dependent" },
+  { id: "gpt-5.3-reasoning", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true, availability: "tenant_dependent", catalog: false },
   { id: "gpt-5.4", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true, availability: "tenant_dependent" },
   { id: "gpt-5.4-reasoning", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true, availability: "tenant_dependent" },
   { id: "gpt-5.5", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true },
   { id: "gpt-5.5-reasoning", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true },
-  { id: "gpt-5.6-sol", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true },
-  { id: "gpt-5.6-terra", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true, availability: "tenant_dependent" },
-  { id: "gpt-5.6-luna", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true, availability: "tenant_dependent" },
+  { id: "gpt-5.6-sol", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true, catalog: false },
+  { id: "gpt-5.6-terra", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true, availability: "tenant_dependent", catalog: false },
+  { id: "gpt-5.6-luna", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true, availability: "tenant_dependent", catalog: false },
   { id: "gpt-5.6-reasoning", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true },
   // CF2 accepted this exact ChatHub tone and rejected a deliberately invalid
   // control tone. Microsoft still does not expose a resolved weight/version
   // in the response, so availability remains tenant-dependent.
-  { id: "gpt-6-astra", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true, availability: "tenant_dependent" },
+  { id: "gpt-6-astra", owner: "microsoft-365", contextWindow: 224_000, maxOutputTokens: 128_000, reasoning: true, availability: "tenant_dependent", catalog: false },
+  { id: "flux-3", owner: "microsoft-365", contextWindow: 32_000, maxOutputTokens: 4_096, reasoning: false, availability: "tenant_dependent", tone: "Magic" },
+  { id: "flux-4", owner: "microsoft-365", contextWindow: 32_000, maxOutputTokens: 4_096, reasoning: false, availability: "tenant_dependent", tone: "Magic" },
   { id: "claude-sonnet", owner: "anthropic-via-microsoft-365", contextWindow: 200_000, maxOutputTokens: 64_000, reasoning: true },
   { id: "claude-sonnet-reasoning", owner: "anthropic-via-microsoft-365", contextWindow: 200_000, maxOutputTokens: 64_000, reasoning: true },
 ];
@@ -313,7 +316,7 @@ export const CODEX_BASE_INSTRUCTIONS = [
 ].join(" ");
 
 export function modelCatalog(): Record<string, unknown>[] {
-  return allModels().map((model) => ({
+  return allModels().filter((model) => model.catalog !== false).map((model) => ({
     id: model.id,
     object: "model",
     owned_by: model.owner,
@@ -352,7 +355,7 @@ export function codexModelCatalog(clientVersion = ""): { models: Record<string, 
   // send X-OpenAI-Internal-Codex-Responses-Lite and reject the model locally.
   const responsesLite = false;
   return {
-    models: allModels().filter((model) => model.tone !== "Magic").map((model, index) => {
+    models: allModels().filter((model) => model.catalog !== false && model.tone !== "Magic").map((model, index) => {
       return {
       slug: model.id,
       display_name: model.id,

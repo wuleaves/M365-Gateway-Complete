@@ -1425,7 +1425,7 @@
             <div style="display:flex;flex-direction:column;gap:10px">
               <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:var(--card-sub-bg);border:1px solid var(--table-border);border-radius:var(--radius-md)">
                 <div>
-                  <strong style="font-size:13px;color:var(--text-main)">gpt-5.6-sol</strong>
+                  <strong style="font-size:13px;color:var(--text-main)">gpt-5.6-reasoning</strong>
                   <span style="font-size:11px;color:var(--text-dim);margin-left:8px">224K Context &bull; Text &bull; Tools</span>
                 </div>
                 <span class="badge-glass badge-emerald">已就绪</span>
@@ -1439,10 +1439,10 @@
               </div>
               <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:var(--card-sub-bg);border:1px solid var(--table-border);border-radius:var(--radius-md)">
                 <div>
-                  <strong style="font-size:13px;color:var(--text-main)">gpt-6-astra</strong>
-                  <span style="font-size:11px;color:var(--text-dim);margin-left:8px">224K Context &bull; 租户相关可用性</span>
+                  <strong style="font-size:13px;color:var(--text-main)">flux-3 / flux-4</strong>
+                  <span style="font-size:11px;color:var(--text-dim);margin-left:8px">图片生成 &bull; 租户相关可用性</span>
                 </div>
-                <span class="badge-glass badge-blue">推理优化</span>
+                <span class="badge-glass badge-blue">图片模型</span>
               </div>
             </div>
           </div>
@@ -1613,13 +1613,13 @@
                   <td>标准 / 推理路由</td>
                 </tr>
                 <tr>
-                  <td><strong style="color:var(--text-main)">gpt-5.3 / gpt-5.3-reasoning</strong></td>
+                  <td><strong style="color:var(--text-main)">gpt-5.3</strong></td>
                   <td>Microsoft 365</td>
                   <td><span class="mono-tag">224K / 输入 96K</span></td>
                   <td><span class="badge-glass badge-amber">租户相关</span></td>
                   <td><span class="badge-glass badge-emerald">支持</span></td>
                   <td><span class="badge-glass badge-emerald">支持</span></td>
-                  <td>标准 / 推理路由</td>
+                  <td>标准路由；高 reasoning effort 可选推理 tone</td>
                 </tr>
                 <tr>
                   <td><strong style="color:var(--text-main)">gpt-5.4 / gpt-5.4-reasoning</strong></td>
@@ -1631,22 +1631,13 @@
                   <td>标准 / 推理路由</td>
                 </tr>
                 <tr>
-                  <td><strong style="color:var(--text-main)">gpt-5.6-terra / gpt-5.6-luna</strong></td>
+                  <td><strong style="color:var(--text-main)">flux-3 / flux-4</strong></td>
                   <td>Microsoft 365</td>
-                  <td><span class="mono-tag">224K / 输入 96K</span></td>
+                  <td><span class="mono-tag">图片专用</span></td>
                   <td><span class="badge-glass badge-amber">租户相关</span></td>
-                  <td><span class="badge-glass badge-emerald">支持</span></td>
-                  <td><span class="badge-glass badge-emerald">支持</span></td>
-                  <td>推理路由；租户相关可用性</td>
-                </tr>
-                <tr>
-                  <td><strong style="color:var(--text-main)">gpt-5.6-sol</strong></td>
-                  <td>Microsoft 365</td>
-                  <td><span class="mono-tag">224K / 输入 96K</span></td>
-                  <td><span class="badge-glass badge-amber">未开放</span></td>
-                  <td><span class="badge-glass badge-emerald">支持</span></td>
-                  <td><span class="badge-glass badge-emerald">支持</span></td>
-                  <td>OpenAI Chat Completions / Responses</td>
+                  <td><span class="badge-glass badge-amber">不适用</span></td>
+                  <td><span class="badge-glass badge-amber">不适用</span></td>
+                  <td>图片生成专用；租户相关可用性</td>
                 </tr>
                 <tr>
                   <td><strong style="color:var(--text-main)">gpt-5.6-reasoning</strong></td>
@@ -1656,15 +1647,6 @@
                   <td><span class="badge-glass badge-emerald">支持</span></td>
                   <td><span class="badge-glass badge-emerald">支持</span></td>
                   <td>推理路由；公开摘要按上游实际返回</td>
-                </tr>
-                <tr>
-                  <td><strong style="color:var(--text-main)">gpt-6-astra</strong></td>
-                  <td>Microsoft 365</td>
-                  <td><span class="mono-tag">224K / 输入 96K</span></td>
-                  <td><span class="badge-glass badge-amber">未开放</span></td>
-                  <td><span class="badge-glass badge-emerald">支持</span></td>
-                  <td><span class="badge-glass badge-emerald">支持</span></td>
-                  <td>租户相关可用性</td>
                 </tr>
                 <tr>
                   <td><strong style="color:var(--text-main)">gpt-5.5</strong></td>
@@ -1708,8 +1690,8 @@
           <div style="margin-top:18px;padding:16px;background:var(--card-sub-bg);border:1px solid var(--table-border);border-radius:var(--radius-md)">
             <div style="font-size:12px;font-weight:700;color:var(--text-main);margin-bottom:10px">兼容请求别名（不会在标准 /v1/models 中重复返回）</div>
             <div style="display:flex;flex-wrap:wrap;gap:8px;font-size:11px;color:var(--text-dim)">
-              <span class="mono-tag">gpt-5.6 → gpt-5.6-sol</span>
-              <span class="mono-tag">m365-copilot → gpt-5.6-sol</span>
+              <span class="mono-tag">gpt-5.6-sol / terra / luna：旧客户端兼容</span>
+              <span class="mono-tag">m365-copilot → gpt-5.6-sol（旧客户端）</span>
               <span class="mono-tag">gpt-5.5-think-deeper → gpt-5.5-reasoning</span>
               <span class="mono-tag">gpt-5.6-think-deeper → gpt-5.6-reasoning</span>
               <span class="mono-tag">claude → claude-sonnet</span>

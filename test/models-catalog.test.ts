@@ -19,7 +19,8 @@ describe("extended Go-compatible model catalog", () => {
   it("marks newly imported models tenant-dependent rather than pretending they are verified", () => {
     const ids = new Map(modelCatalog().map((model) => [String(model.id), model]));
     expect(ids.get("gpt-5.4")).toMatchObject({ x_m365_availability: "tenant_dependent" });
-    expect(ids.get("gpt-5.6-terra")).toMatchObject({ x_m365_availability: "tenant_dependent" });
+    expect(ids.get("flux-3")).toMatchObject({ x_m365_availability: "tenant_dependent" });
+    expect(ids.has("gpt-5.6-terra")).toBe(false);
   });
 
   it("supports bounded administrator model aliases and ChatHub tones", () => {

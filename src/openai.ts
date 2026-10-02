@@ -7860,13 +7860,15 @@ async function imageGeneration(
   let count: number;
   let responseFormat = "url";
   let content: unknown;
+  let imageModel = "flux-3";
   if (url.pathname === "/v1/images/generations") {
     const input = await body<{ prompt?: unknown; n?: unknown; response_format?: unknown; model?: unknown }>(request);
     validateImageModel(input.model);
+    imageModel = input.model === "flux-4" ? "flux-4" : "flux-3";
     prompt = boundedImagePrompt(input.prompt, "");
     count = boundedImageCount(input.n);
     responseFormat = typeof input.response_format === "string" ? input.response_format : "url";
-    content = `${prompt}\n\nGenerate exactly ${count} image${count === 1 ? "" : "s"}.`;
+    content = `${prompt}\n\nModel: ${imageModel}. Generate exactly ${count} image${count === 1 ? "" : "s"}.`;
   } else {
     const form = await imageForm(request);
     prompt = boundedImagePrompt(form.get("prompt"));
@@ -7874,7 +7876,8 @@ async function imageGeneration(
     responseFormat = typeof form.get("response_format") === "string" ? String(form.get("response_format")) : "url";
     const model = form.get("model");
     validateImageModel(model ?? undefined);
-    const parts: Record<string, unknown>[] = [{ type: "text", text: `${prompt}\n\nReturn exactly ${count} image${count === 1 ? "" : "s"}.` }];
+    imageModel = model === "flux-4" ? "flux-4" : "flux-3";
+    const parts: Record<string, unknown>[] = [{ type: "text", text: `${prompt}\n\nModel: ${imageModel}. Return exactly ${count} image${count === 1 ? "" : "s"}.` }];
     const images = [...form.getAll("image"), ...form.getAll("mask")].slice(0, 4);
     if (images.length === 0) throw new Error("INVALID_IMAGE_REQUEST");
     for (const image of images) {
@@ -7890,7 +7893,7 @@ async function imageGeneration(
   const synthetic = new Request(new URL("/v1/chat/completions", request.url), {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-M365-Session-Id": `image-${crypto.randomUUID()}` },
-    body: JSON.stringify({ model: "m365-image", messages: [{ role: "user", content }], stream: false }),
+    body: JSON.stringify({ model: imageModel, messages: [{ role: "user", content }], stream: false }),
     signal: request.signal,
   });
   const completion = await chatCompletions(synthetic, env, metrics);
@@ -7913,7 +7916,7 @@ async function imageGeneration(
 }
 
 export function validateImageModel(model: unknown): void {
-  if (model !== undefined && model !== "m365-image") throw new Error("INVALID_IMAGE_MODEL");
+  if (model !== undefined && !["flux-3", "flux-4", "m365-image"].includes(model as string)) throw new Error("INVALID_IMAGE_MODEL");
 }
 
 export async function openAIRequest(
@@ -7945,7 +7948,7 @@ export async function openAIRequest(
     const code = cause instanceof Error ? cause.message : "REQUEST_FAILED";
     if (code === "EMPTY_PROMPT") return apiError(400, "invalid_request_error", "a non-empty prompt is required");
     if (code === "INVALID_IMAGE_REQUEST") return apiError(400, "invalid_image_request", "image request fields or multipart image data are invalid");
-    if (code === "INVALID_IMAGE_MODEL") return apiError(400, "invalid_image_model", "image requests support only m365-image");
+    if (code === "INVALID_IMAGE_MODEL") return apiError(400, "invalid_image_model", "image requests support flux-3 or flux-4 (legacy m365-image is also accepted)");
     if (code === "IMAGE_B64_UNAVAILABLE") return apiError(400, "image_response_format_unsupported", "b64_json is available only when Microsoft 365 returns an inline image");
     if (code === "INVALID_JSON") return apiError(400, "invalid_json", "request body must be valid JSON");
     if (code === "INVALID_REQUEST" || code === "INVALID_INSTRUCTIONS") return apiError(400, "invalid_request_error", "request body does not match the selected endpoint");

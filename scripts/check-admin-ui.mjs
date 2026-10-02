@@ -40,7 +40,7 @@ const assertions = [
   [/escapeHtml\(a\.tokenState \|\| "未知"\)/u, "dynamic account state must be HTML escaped"],
   [/gpt-5\.6-sol/u, "the current default gateway model must be shown"],
   [/gpt-5\.5-reasoning/u, "the complete canonical GPT model catalog must be shown"],
-  [/gpt-6-astra/u, "the current tenant-dependent gateway model must be shown"],
+  [/flux-3 \/ flux-4/u, "the upstream image model names must be shown"],
   [/claude-sonnet/u, "the current Claude gateway model must be shown"],
   [/claude-sonnet-reasoning/u, "the complete canonical Claude model catalog must be shown"],
   [/gpt-5\.4-reasoning/u, "the model page must show the Go gateway's GPT-5.4 reasoning route"],
