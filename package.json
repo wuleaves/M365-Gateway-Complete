@@ -1,6 +1,6 @@
 {
   "name": "m365-gateway-complete",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Complete Microsoft 365 gateway package for Cloudflare Workers, Node/Docker, and optional fixed-target egress relay deployments",
   "private": true,
   "type": "module",
@@ -13,7 +13,7 @@
     "check:deploy": "node scripts/check-deploy-helpers.mjs",
     "check:functional": "node scripts/check-functional-safety.mjs",
     "check:no-docs": "node scripts/check-no-docs.mjs",
-    "check:ui": "node scripts/check-admin-ui.mjs",
+    "check:ui": "node scripts/check-admin-ui.mjs && node scripts/check-ui-locales.mjs",
     "deploy": "node deploy-cloudflare.mjs",
     "deploy:one-click": "node deploy-cloudflare.mjs",
     "deploy:dry": "node deploy-cloudflare.mjs --dry-run --yes --client-id 00000000-0000-0000-0000-000000000000",
@@ -21,7 +21,8 @@
     "dev": "wrangler dev",
     "typecheck": "tsc --noEmit",
     "types": "wrangler types src/worker-configuration.d.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "probe:upstream": "node scripts/probe-upstream-073.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "latest",
@@ -33,5 +34,8 @@
   "overrides": {
     "sharp": "0.35.5",
     "undici": "8.11.2"
+  },
+  "engines": {
+    "node": ">=22.0.0"
   }
 }

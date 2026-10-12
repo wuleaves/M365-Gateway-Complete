@@ -4,7 +4,7 @@ This directory is an independent server-oriented derivative of the Cloudflare ba
 
 ## Requirements
 
-- Node.js 20 or newer, with Node.js 22 LTS recommended.
+- Node.js 22 or newer, matching the locked Wrangler runtime and Docker images.
 - Persistent local storage with backups.
 - A TLS reverse proxy for any non-local deployment.
 - Secrets supplied by the operating system, container orchestrator, or a secret manager.

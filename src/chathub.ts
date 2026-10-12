@@ -7,6 +7,7 @@ import {
   type NormalizedMediaAttachment,
 } from "./multimodal";
 import { validateToolArguments } from "./tool-schema";
+import { parseRetryAfter, retryAfterMilliseconds } from "./upstream-errors";
 
 const RS = "\u001e";
 // Upgrade via fetch() uses HTTPS. Cloudflare turns the successful 101
@@ -94,12 +95,22 @@ export function assertBoundedPayload(
 ): void {
   if (observed > limit) throw new BoundedPayloadError(subtype, observed, limit, phase);
 }
+
+export function sendSocketFrame(socket: Pick<WebSocket, "send">, payload: string): void {
+  try { socket.send(payload); }
+  catch (cause) {
+    const timeout = cause instanceof Error && /timeout|timed out|deadline exceeded/iu.test(cause.message);
+    // Preserve the operation kind without retaining a URL or credential from
+    // a runtime's exception. Read failures keep their separate read code.
+    throw new Error(timeout ? "WS_WRITE_TIMEOUT" : "WS_WRITE_FAILED");
+  }
+}
 // Microsoft can leave a submitted invocation connected while producing no
 // semantic frames.  The request-wide deadline remains ten minutes for long
 // turns that keep reporting progress, but a completely idle invocation must
 // fail much sooner so Codex can surface/retry it instead of appearing frozen.
 const CHAT_PROGRESS_IDLE_TIMEOUT_MS = 90_000;
-const CHAT_FIRST_OUTPUT_TIMEOUT_MS = 75_000;
+export const CHAT_FIRST_OUTPUT_TIMEOUT_MS = 40_000;
 // Handshake is a transport preflight, not model generation. Keep it short so
 // a dead/incorrect ChatHub route is retried or surfaced promptly instead of
 // consuming most of the client's idle window before any invocation exists.
@@ -876,14 +887,30 @@ function scrubNarration(text: string): string {
  * Treat only the short, provider-authored capacity placeholders as failures;
  * ordinary user/model prose mentioning rate limits must remain visible.
  */
-export function syntheticUpstreamFailureCode(value: unknown): "CHAT_UPSTREAM_RATE_LIMITED" | null {
+export function syntheticUpstreamFailureCode(value: unknown): "CHAT_UPSTREAM_RATE_LIMITED" | "CHAT_UPSTREAM_CONTENT_BLOCKED" | null {
   if (typeof value !== "string") return null;
   const normalized = value.replace(/\s+/gu, " ").trim().toLowerCase();
   if (normalized.length === 0 || normalized.length > 512) return null;
   if (/^(?:we['’]?re|we are) temporarily unable to respond to (?:this|the current) volume of requests(?:[.! ]+please try again later[.!]*)?$/u.test(normalized)) {
     return "CHAT_UPSTREAM_RATE_LIMITED";
   }
+  // Match whole canned replies, not arbitrary user/model prose mentioning a
+  // refusal. These nominal-success placeholders must not terminate an agent
+  // turn as if useful work had completed.
+  if (/^(?:sorry[,!]?\s+)?i (?:wasn['’]t able|(?:am |['’]m )?unable) to respond(?: to that)?[.!]?(?:\s+is there something else i can help (?:you )?with\??)?$/u.test(normalized)
+    || /^(?:i['’]m |i am )?sorry[,!]? i (?:can['’]t|cannot) respond(?: to (?:that|this request))?[.!]?$/u.test(normalized)
+    || /^抱歉[，,]我(?:无法回答这个问题|现在无法回答)[。.!！]?(?:还有什么我可以帮(?:助)?你的吗[？?]?)?$/u.test(normalized)) {
+    return "CHAT_UPSTREAM_CONTENT_BLOCKED";
+  }
   return null;
+}
+
+function requestPlaceholderFailure(value: unknown, request: ChatHubRequest): ReturnType<typeof syntheticUpstreamFailureCode> {
+  const failure = syntheticUpstreamFailureCode(value);
+  // Caller-tool refusals are repaired by the bounded tool resolver; suppressing
+  // their text here would erase the evidence that drives that existing path.
+  return failure === "CHAT_UPSTREAM_CONTENT_BLOCKED" && (request.tools?.length ?? 0) > 0
+    && String(request.toolChoice ?? "auto").toLowerCase() !== "none" ? null : failure;
 }
 
 function toolProtocolPrompt(text: string, tools: unknown[] = [], choice: unknown): string {
@@ -1475,14 +1502,16 @@ export class ChatHubAttemptError extends Error {
   readonly invocationSubmitted: boolean;
   readonly terminalEmptyQuota: boolean;
   readonly boundedPayload: BoundedPayloadMetadata | null;
+  readonly retryAfterMs: number;
 
-  constructor(cause: unknown, invocationSubmitted: boolean, terminalEmptyQuota = false) {
+  constructor(cause: unknown, invocationSubmitted: boolean, terminalEmptyQuota = false, retryAfterMs = retryAfterMilliseconds(cause)) {
     super(failureMessage(cause));
     this.name = "ChatHubAttemptError";
     this.invocationSubmitted = invocationSubmitted;
     this.terminalEmptyQuota = terminalEmptyQuota;
     this.reconnectSafe = mayReconnectChatHubFailure(cause, invocationSubmitted);
     this.boundedPayload = boundedPayloadMetadata(cause);
+    this.retryAfterMs = retryAfterMilliseconds({ retryAfterMs });
   }
 }
 
@@ -1968,14 +1997,14 @@ async function runChatHub(
     throw new ChatHubAttemptError(new Error("WS_DIAL_ERROR"), false);
   }
   const socket = response.webSocket;
-  if (!socket) throw new ChatHubAttemptError(new Error(`${relay ? "RELAY_DIAL_FAILED" : "WS_DIAL_FAILED"}:${response.status}`), false);
+  if (!socket) throw new ChatHubAttemptError(new Error(`${relay ? "RELAY_DIAL_FAILED" : "WS_DIAL_FAILED"}:${response.status}`), false, false, parseRetryAfter(response.headers.get("Retry-After")));
   socket.accept();
   const reader = socketReader(socket);
   const abort = (): void => reader.close();
   request.signal?.addEventListener("abort", abort, { once: true });
   let ping: ReturnType<typeof setInterval> | undefined;
   try {
-    socket.send(`{"protocol":"json","version":1}${RS}`);
+    sendSocketFrame(socket, `{"protocol":"json","version":1}${RS}`);
     const deadline = request.deadlineAt ?? Date.now() + 10 * 60_000;
     const handshakeTimeout = Math.max(1, Math.min(CHAT_HANDSHAKE_TIMEOUT_MS, deadline - Date.now()));
     let pendingFrame: string;
@@ -1991,14 +2020,14 @@ async function runChatHub(
     ping = setInterval(() => {
       try { socket.send(`{"type":6}${RS}`); } catch { /* read side reports closure */ }
     }, 15_000);
-    socket.send(buildChatPayload(request, requestId, attachments, uploadedImages));
+    sendSocketFrame(socket, buildChatPayload(request, requestId, attachments, uploadedImages));
     invocationSubmitted = true;
 
     let streamed = "";
     let final = "";
     let resultError = "";
     let disengaged = false;
-    let syntheticFailureCode: "CHAT_UPSTREAM_RATE_LIMITED" | null = null;
+    let syntheticFailureCode: ReturnType<typeof syntheticUpstreamFailureCode> = null;
     let throttling: unknown;
     let functionCall: FunctionCall | null = null;
     let malformedFunctionCall = false;
@@ -2037,8 +2066,13 @@ async function runChatHub(
           }
         }
       }
-      syntheticFailureCode ||= syntheticUpstreamFailureCode(text);
-      if (syntheticFailureCode) throw new Error(syntheticFailureCode);
+      syntheticFailureCode ||= requestPlaceholderFailure(text, request);
+      // A declared caller-tool turn has an existing bounded refusal-repair
+      // path. Keep that contract; plain chat must surface the canned failure.
+      if (syntheticFailureCode && !(syntheticFailureCode === "CHAT_UPSTREAM_CONTENT_BLOCKED"
+        && callerTools.length > 0 && String(request.toolChoice ?? "auto").toLowerCase() !== "none")) {
+        throw new Error(syntheticFailureCode);
+      }
       if (!text && !functionCall && images.length === 0) {
         // A malformed native envelope is a completed Microsoft transport with
         // an invalid semantic decision. Return that closed state to the tool
@@ -2151,7 +2185,7 @@ async function runChatHub(
             if (messages.some((message) => message.messageType === "Disengaged")) disengaged = true;
             const toolFrame = messages.some((message) => message.messageType === "Progress" || ["SearchResults", "Code", "ToolCall"].includes(String(message.contentType ?? "")));
             if (!toolFrame && typeof update.writeAtCursor === "string" && update.writeAtCursor.length > 0) {
-              const placeholder = syntheticUpstreamFailureCode(update.writeAtCursor);
+              const placeholder = requestPlaceholderFailure(update.writeAtCursor, request);
               if (placeholder) syntheticFailureCode ||= placeholder;
               else streamed = appendChatHubDelta(streamed, update.writeAtCursor, emit);
               assertBoundedPayload("CHAT_OUTPUT_TOO_LARGE", streamed.length, MAX_OUTPUT_CHARACTERS, "streamed_text");
@@ -2161,7 +2195,7 @@ async function runChatHub(
               const answerText = chatHubAnswerMessageText(message);
               if (answerText) {
                 assertBoundedPayload("CHAT_OUTPUT_TOO_LARGE", answerText.length, MAX_OUTPUT_CHARACTERS, "update_snapshot");
-                const placeholder = syntheticUpstreamFailureCode(answerText);
+                const placeholder = requestPlaceholderFailure(answerText, request);
                 if (placeholder) syntheticFailureCode ||= placeholder;
                 else streamed = appendChatSnapshot(streamed, answerText, emit);
               }
@@ -2191,7 +2225,7 @@ async function runChatHub(
             const answerText = chatHubAnswerMessageText(message);
             if (answerText) {
               assertBoundedPayload("CHAT_OUTPUT_TOO_LARGE", answerText.length, MAX_OUTPUT_CHARACTERS, "completion_snapshot");
-              const placeholder = syntheticUpstreamFailureCode(answerText);
+              const placeholder = requestPlaceholderFailure(answerText, request);
               if (placeholder) syntheticFailureCode ||= placeholder;
               else streamed = appendChatSnapshot(streamed, answerText, emit);
             }
@@ -2199,7 +2233,7 @@ async function runChatHub(
           const result = isRecord(item?.result) ? item.result : undefined;
           if (typeof result?.message === "string") {
             assertBoundedPayload("CHAT_OUTPUT_TOO_LARGE", result.message.length, MAX_OUTPUT_CHARACTERS, "completion_message");
-            const placeholder = syntheticUpstreamFailureCode(result.message);
+            const placeholder = requestPlaceholderFailure(result.message, request);
             if (placeholder) syntheticFailureCode ||= placeholder;
             else final = result.message;
           }

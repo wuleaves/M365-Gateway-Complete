@@ -1,11 +1,14 @@
 import { DurableObject } from "cloudflare:workers";
 import { classifyAccountFailure } from "./account-routing";
+import { CHAT_FIRST_OUTPUT_TIMEOUT_MS } from "./chathub";
 import { decryptJSON, encryptJSON, passwordRecord, randomToken, sha256, verifyPassword } from "./crypto";
 import { refreshToken, scopedAccessToken, type ScopedAccessToken } from "./oauth";
 import { parsePasskeyRegistration, randomChallenge, verifyPasskeyAssertion, verifyTOTP } from "./mfa";
 import type { MigratedAccountInput } from "./migration";
 import { normalizeRuntimeModelConfiguration, type RuntimeModelConfiguration } from "./models";
 import { aggregateUsageTrend, type UsageTrendRow } from "./usage-trend";
+import { addSLAMetric, parseSLAState, slaSnapshot } from "./sla-metrics";
+import { retryAfterMilliseconds } from "./upstream-errors";
 import type {
   AccountEgress,
   DiagnosticInput,
@@ -444,6 +447,7 @@ export class TenantState extends DurableObject<Env> {
       if (!totalColumns.has(column)) this.ctx.storage.sql.exec(`ALTER TABLE request_totals ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`);
     }
     this.currentUsageMinute = this.ctx.storage.sql.exec<{ current_minute: number }>("SELECT current_minute FROM request_totals WHERE singleton=1").one().current_minute;
+    if (!totalColumns.has("sla_state")) this.ctx.storage.sql.exec("ALTER TABLE request_totals ADD COLUMN sla_state TEXT NOT NULL DEFAULT ''");
     const accountColumns = new Set(this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(accounts)").toArray().map((column) => column.name));
     if (!accountColumns.has("sequence_no")) this.ctx.storage.sql.exec("ALTER TABLE accounts ADD COLUMN sequence_no INTEGER NOT NULL DEFAULT 0");
     if (!accountColumns.has("credential_revision")) this.ctx.storage.sql.exec("ALTER TABLE accounts ADD COLUMN credential_revision INTEGER NOT NULL DEFAULT 0");
@@ -489,16 +493,16 @@ export class TenantState extends DurableObject<Env> {
 
   async runtimeConfiguration(): Promise<GatewayRuntimeConfiguration> {
     const raw = this.meta("runtime_configuration");
-    if (!raw) return { firstOutputTimeoutMs: 75_000, models: { aliases: {}, models: [] } };
+    if (!raw) return { firstOutputTimeoutMs: CHAT_FIRST_OUTPUT_TIMEOUT_MS, models: { aliases: {}, models: [] } };
     try {
       const parsed = JSON.parse(raw) as { firstOutputTimeoutMs?: unknown; models?: unknown };
       const timeout = Number(parsed.firstOutputTimeoutMs);
       return {
-        firstOutputTimeoutMs: Number.isInteger(timeout) && timeout >= 5_000 && timeout <= 300_000 ? timeout : 75_000,
+        firstOutputTimeoutMs: Number.isInteger(timeout) && timeout >= 5_000 && timeout <= 300_000 ? timeout : CHAT_FIRST_OUTPUT_TIMEOUT_MS,
         models: normalizeRuntimeModelConfiguration(parsed.models),
       };
     } catch {
-      return { firstOutputTimeoutMs: 75_000, models: { aliases: {}, models: [] } };
+      return { firstOutputTimeoutMs: CHAT_FIRST_OUTPUT_TIMEOUT_MS, models: { aliases: {}, models: [] } };
     }
   }
 
@@ -1006,13 +1010,13 @@ export class TenantState extends DurableObject<Env> {
       }
       const disposition = classifyAccountFailure(cause);
       if (!disposition) throw cause;
-      await this.reportAccountFailure(selected.id, disposition.kind, route.epoch);
+      await this.reportAccountFailure(selected.id, disposition.kind, route.epoch, retryAfterMilliseconds(cause));
       if (preferred || !disposition.mayFailOverBeforeVisibleOutput) throw cause;
       return this.selectAccount("", [...excluded, selected.id]);
     }
   }
 
-  async reportAccountFailure(accountId: string, kind: AccountFailureKind, expectedRouteEpoch?: number): Promise<AccountAvailability> {
+  async reportAccountFailure(accountId: string, kind: AccountFailureKind, expectedRouteEpoch?: number, retryAfterMs = 0): Promise<AccountAvailability> {
     const id = accountId.trim();
     if (!id) throw new Error("ACCOUNT_ID_REQUIRED");
     const exists = this.ctx.storage.sql.exec<{ found: number }>("SELECT 1 AS found FROM accounts WHERE id=?", id).toArray()[0];
@@ -1037,7 +1041,8 @@ export class TenantState extends DurableObject<Env> {
       const isolated = kind === "auth" || kind === "permanent";
       const baseCooldown = kind === "rate_limit" ? 5 * 60_000 : 15_000;
       const maximumCooldown = kind === "rate_limit" ? 60 * 60_000 : 5 * 60_000;
-      const cooldownUntil = isolated ? 0 : now + Math.min(maximumCooldown, baseCooldown * 2 ** Math.min(6, consecutive - 1));
+      const advised = kind === "rate_limit" ? retryAfterMilliseconds({ retryAfterMs }) : 0;
+      const cooldownUntil = isolated ? 0 : now + (advised || Math.min(maximumCooldown, baseCooldown * 2 ** Math.min(6, consecutive - 1)));
       this.ctx.storage.sql.exec(
         `INSERT INTO account_health(account_id,state,failure_kind,failure_count,cooldown_until,last_failure_at,updated_at)
          VALUES(?,?,?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET
@@ -1235,6 +1240,10 @@ export class TenantState extends DurableObject<Env> {
         acceptedMetric = accepted;
         if (!accepted) return;
       }
+      const sla = parseSLAState(this.ctx.storage.sql.exec<{ sla_state: string }>(
+        "SELECT sla_state FROM request_totals WHERE singleton=1",
+      ).one().sla_state);
+      addSLAMetric(sla, durationMs, errorCount > 0, endpoint, now);
       if (previousMinute && previousMinute !== minute) {
         this.ctx.storage.sql.exec(
           `INSERT INTO request_usage_minutes(minute,requests,errors,token_in,token_out)
@@ -1252,7 +1261,7 @@ export class TenantState extends DurableObject<Env> {
          minute_errors=CASE WHEN current_minute=? THEN minute_errors+? ELSE ? END,
          minute_token_in=CASE WHEN current_minute=? THEN minute_token_in+? ELSE ? END,
          minute_token_out=CASE WHEN current_minute=? THEN minute_token_out+? ELSE ? END,
-         current_minute=?,reuse_hits=reuse_hits+?,reuse_misses=reuse_misses+?
+         current_minute=?,reuse_hits=reuse_hits+?,reuse_misses=reuse_misses+?,sla_state=?
          WHERE singleton=1`,
         errorCount,
         tokenIn,
@@ -1261,7 +1270,7 @@ export class TenantState extends DurableObject<Env> {
         minute, minute, errorCount, errorCount,
         minute, tokenIn, tokenIn,
         minute, tokenOut, tokenOut,
-        minute, reuseHit, reuseMiss,
+        minute, reuseHit, reuseMiss, JSON.stringify(sla),
       );
       if (accountId) {
         this.ctx.storage.sql.exec(
@@ -1425,10 +1434,21 @@ export class TenantState extends DurableObject<Env> {
     return { hits: row.reuse_hits, misses: row.reuse_misses, hitRate: total ? row.reuse_hits / total : 0 };
   }
 
+  async slaMetrics() {
+    const state = parseSLAState(this.ctx.storage.sql.exec<{ sla_state: string }>(
+      "SELECT sla_state FROM request_totals WHERE singleton=1",
+    ).one().sla_state);
+    const pool = await this.accountPoolStatus();
+    const expired = this.ctx.storage.sql.exec<{ count: number }>(
+      "SELECT COUNT(*) AS count FROM accounts a JOIN account_health h ON h.account_id=a.id WHERE h.state='isolated' AND h.failure_kind='auth'",
+    ).one().count;
+    return slaSnapshot(state, { total: pool.total, online: pool.available, cooldown: pool.cooling, expired, isolated: pool.isolated });
+  }
+
   async resetRequestStats(): Promise<GatewayStats> {
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
-        "UPDATE request_totals SET request_count=0,error_count=0,token_in=0,token_out=0,last_request_at=0,current_minute=0,minute_requests=0,minute_errors=0,minute_token_in=0,minute_token_out=0,reuse_hits=0,reuse_misses=0 WHERE singleton=1",
+        "UPDATE request_totals SET request_count=0,error_count=0,token_in=0,token_out=0,last_request_at=0,current_minute=0,minute_requests=0,minute_errors=0,minute_token_in=0,minute_token_out=0,reuse_hits=0,reuse_misses=0,sla_state='' WHERE singleton=1",
       );
       this.ctx.storage.sql.exec("DELETE FROM account_request_stats");
       this.ctx.storage.sql.exec("DELETE FROM recorded_request_metrics");

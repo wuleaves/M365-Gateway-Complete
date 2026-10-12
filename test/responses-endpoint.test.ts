@@ -733,19 +733,16 @@ describe("Responses endpoint regressions", () => {
     }
   }, 20_000);
 
-  it("terminates a fast streaming preflight failure with response.failed instead of closing silently", async () => {
+  it("returns the real HTTP status for a fast failure before the streaming response opens", async () => {
     const auth = await credential();
     const response = await postResponse(auth.apiKey, {
       stream: true,
       input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "test fast failure" }] }],
     }, "not-a-real-model");
 
-    expect(response.status).toBe(200);
-    expect(response.headers.get("Content-Type")).toContain("text/event-stream");
-    const text = await response.text();
-    expect(text).toContain("event: response.failed");
-    expect(text).toContain('"code":"unsupported_model"');
-    expect(text).toContain("data: [DONE]");
+    expect(response.status).toBe(400);
+    expect(response.headers.get("Content-Type")).toContain("application/json");
+    expect(await response.json()).toMatchObject({ error: { code: "unsupported_model" } });
   });
 
   it("routes the real Codex local-web request instead of exposing hosted artifact links", async () => {

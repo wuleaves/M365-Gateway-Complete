@@ -34,6 +34,7 @@ export function classifyAccountFailure(cause: unknown): AccountFailureDispositio
     upper.startsWith("WS_DIAL_FAILED:401")
     || upper.startsWith("WS_DIAL_FAILED:403")
     || upper.includes("INVALID_GRANT")
+    || upper.includes("TOKEN_EXPIRED")
     || upper.includes("UNAUTHORIZED")
     || upper.includes("FORBIDDEN")
     || upper === "MICROSOFT_REFRESH_TOKEN_MISSING"
@@ -73,6 +74,9 @@ export function classifyAccountFailure(cause: unknown): AccountFailureDispositio
     || upper.startsWith("WS_CLOSED_BEFORE_COMPLETION")
     || upper === "WS_ERROR_BEFORE_COMPLETION"
     || upper === "WS_READ_TIMEOUT"
+    || upper === "WS_WRITE_TIMEOUT"
+    || upper === "WS_WRITE_FAILED"
+    || upper.startsWith("WS_DIAL_FAILED:422")
     || upper.startsWith("CHAT_CLOSED_BEFORE_COMPLETION")
     || upper === "CHAT_DEADLINE_EXCEEDED"
     || upper === "CHAT_PROGRESS_TIMEOUT"

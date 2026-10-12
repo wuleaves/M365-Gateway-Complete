@@ -1,12 +1,12 @@
 {
   "package": "M365-Gateway-Complete",
-  "version": "0.2.2",
+  "version": "0.2.4",
   "createdAt": "2026-09-29T22:00:00+08:00",
-  "updatedAt": "2026-10-01T21:24:00+08:00",
+  "updatedAt": "2026-10-12T08:40:54.477Z",
   "source": "consolidated-from-supplied-archives",
   "base": "M365-Gateway-Cloudflare-UI-Mobile-20260917-r9.zip",
   "restoredFrom": "M365-Gateway-OpenSource-20260913.zip",
-  "compatibilityReference": "M365-Copilot2API main at 056c028; portable behavior independently reimplemented for Cloudflare",
+  "compatibilityReference": "M365-Copilot2API v0.7.3 at c6181d263849b2071731d3be6209a023ff62ca7f; portable behavior independently adapted for Cloudflare",
   "includes": [
     "Cloudflare Worker TypeScript source and deployment helper",
     "Node.js and Docker server runtime",
@@ -17,7 +17,10 @@
     "explicit sessions, file/audio media, image generation/edit/variation and first-output timeout",
     "cloud conversations with bound-session cleanup protection, memory, plugins, MCP, runtime models, account health, usage dimensions and timezone-aware trends",
     "registered session management and exact successful session-reuse counts",
-    "optional fixed-target Go egress relay"
+    "optional fixed-target Go egress relay",
+    "all-request SLA counters and bounded histogram latency metrics",
+    "Chinese/English administration assets and English README",
+    "v0.7.3 protocol regression suite and serial candidate SSE probe"
   ],
   "excludes": [
     "node_modules and local build caches",
@@ -30,13 +33,24 @@
     "npmCheck": "passed",
     "typecheck": "passed",
     "adminUiContract": "passed",
-    "testFiles": 30,
-    "tests": 524,
-    "cloudflareDryRun": "passed",
-    "npmAudit": "dependency-set-unchanged; network advisory check not rerun",
-    "secretScan": "passed-no-findings",
-    "relayStructure": "passed",
-    "goRelayTests": "not-run-go-toolchain-not-installed",
+    "uiLocales": "passed-both-bundles",
+    "testFiles": 31,
+    "tests": 543,
+    "upstreamRegressionCases": 19,
+    "finalErrorMappingFocusedTests": 53,
+    "cloudflareDryRun": "passed-no-deployment",
+    "browserUi": "passed-offline-preview",
+    "liveUpstream": "not-run-no-production-credentials",
+    "goRelayTests": "not-run-relay-unchanged-and-go-unavailable",
     "wrangler": "4.143.0"
-  }
+  },
+  "upstream": {
+    "repository": "https://github.com/HEXUXIU/M365-Copilot2API",
+    "tag": "v0.7.3",
+    "commit": "c6181d263849b2071731d3be6209a023ff62ca7f",
+    "baseline": "056c028",
+    "reviewedCommits": 15,
+    "matrix": "UPGRADE-0.2.4.md"
+  },
+  "sourceRepoCommit": "d234ee76f9a2f52ca8466945367c22b3f26aec82"
 }

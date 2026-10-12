@@ -411,6 +411,10 @@ async function adminRoute(request: Request, env: Env, url: URL): Promise<Respons
   if (url.pathname === "/api/admin/usage/reuse" && request.method === "GET") {
     return json(await state.sessionReuseStats());
   }
+  if (url.pathname === "/api/admin/metrics" || url.pathname === "/api/metrics") {
+    if (request.method !== "GET") return error(405, "method_not_allowed", "GET is required for metrics");
+    return json(await state.slaMetrics());
+  }
   if (url.pathname === "/api/admin/sessions" && request.method === "GET") {
     return json({ sessions: await state.listAdminSessions() });
   }
@@ -897,7 +901,7 @@ export default {
           })
         : error(405, "method_not_allowed", "GET is required for /api/health");
       else if (url.pathname === ACCOUNT_MIGRATION_PATH) response = await migrationRoute(request, env);
-      else if (url.pathname.startsWith("/api/admin/")) response = await adminRoute(request, env, url);
+      else if (url.pathname.startsWith("/api/admin/") || url.pathname === "/api/metrics") response = await adminRoute(request, env, url);
       else if (url.pathname.startsWith("/api/accounts")) response = await accountRoute(request, env, url);
       else if (url.pathname.startsWith("/api/auth/")) response = await oauthRoute(request, env, url);
       else if (url.pathname === "/api/plugins" || url.pathname.startsWith("/api/conversations")) response = await serviceRoute(request, env, url);

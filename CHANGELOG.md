@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.4 — 2026-10-12
+
+- Reviewed all 15 commits from upstream baseline `056c028` to v0.7.3 (`c6181d2`); recorded every adaptation in `UPGRADE-0.2.4.md`.
+- Reduced the default first-output timeout to 40 seconds while preserving saved overrides and the no-replay boundary after Microsoft submission.
+- Added expired-token and write-failure classification, numeric Retry-After propagation across DO RPC and account cooldown, and cancellable jittered recovery waits bounded at 12 seconds.
+- Withheld Chat opening frames until real output or the first heartbeat to preserve early failure status. Fast Responses preflight errors retain their HTTP status; committed streams keep explicit SSE failure events.
+- Preserved confirmed handshake HTTP statuses with redacted messages and separate timeout/overload codes.
+- Removed split Microsoft entity tags without dropping code fences or trailing text; recognized canned non-answers while preserving bounded caller-tool refusal recovery.
+- Added administrator-only `/api/metrics` and `/api/admin/metrics` with all-request counters, bounded latency histograms, honest window/algorithm metadata and a settings UI.
+- Added shared Chinese/English translations to both UI bundles and English documentation; native tools are the fallback when the deployment setting is absent.
+- Added 19 targeted regressions, language contract checks and a serial candidate SSE probe. Existing Codex namespace/custom-tool compatibility and durable state limits are retained.
+- Go connection pools, arbitrary proxies, process startup, raw error-body exposure and accepted-invocation replay remain outside the existing Worker architecture.
+
 ## 0.2.2 — 2026-10-01
 
 - Protected recent client-bound cloud conversations during administrator cleanup and deletion. Conversations without a reliable last-activity timestamp are skipped instead of being deleted by creation age alone.

@@ -17,7 +17,7 @@ import { evaluateCompletionEvidence } from "./completion-evidence";
 import { decryptJSON, encryptJSON, sha256 } from "./crypto";
 import type { Env } from "./types";
 import { canonicalModel, estimatePromptTokens, modelMaxInputTokens, modelPromptCharacterLimit, modelTone } from "./models";
-import type { AccountSelection } from "./tenant-state";
+import type { AccountSelection, AccountPoolStatus } from "./tenant-state";
 import {
   completedEvidenceContext,
   completedToolSnapshots,
@@ -33,6 +33,8 @@ import {
 import { validateToolArguments } from "./tool-schema";
 import { appendPublicReasoning, publicReasoningEvents, requestsPublicReasoning } from "./public-reasoning";
 import { CitationMarkerStreamFilter, stripInternalCitationMarkers } from "./public-citations";
+import { retryAfterMilliseconds } from "./upstream-errors";
+import { SSEPreflight } from "./sse-preflight";
 import { createUpstreamGateLifecycle, type UpstreamGateLifecycle } from "./upstream-lifecycle";
 import { MAX_AI_REQUEST_BYTES, MAX_RESPONSES_REQUEST_BYTES, readBytesLimited, readJSONLimited } from "./request-body";
 import type { RequestMetricTracker } from "./request-metrics";
@@ -258,6 +260,7 @@ async function durableChatHub(
       new Error(outcome.failure.message),
       outcome.failure.invocationSubmitted,
       outcome.failure.terminalEmptyQuota,
+      outcome.failure.retryAfterMs,
     );
   }
   // The DO cannot receive an AbortSignal over RPC. Preserve cancellation
@@ -1456,15 +1459,22 @@ export function publicFailure(cause: unknown): { code: string; message: string }
   if (raw === "NO_USABLE_ACCOUNT") return { code: "account_pool_isolated", message: "all Microsoft 365 accounts require administrator attention" };
   if (raw === "CHAT_THROTTLED_QUOTA_EXHAUSTED") return { code: "upstream_throttled", message: "the selected Microsoft 365 account has exhausted its current allowance" };
   if (raw === "CHAT_UPSTREAM_RATE_LIMITED") return { code: "upstream_rate_limit", message: "Microsoft ChatHub is temporarily rate-limited; retry later" };
+  if (raw === "CHAT_UPSTREAM_CONTENT_BLOCKED") return { code: "upstream_content_blocked", message: "Microsoft 365 could not answer this request; revise the request or retry later" };
   if (raw === "CHAT_DISENGAGED") return { code: "upstream_disengaged", message: "Microsoft ChatHub disengaged from this turn; wait briefly and retry with a smaller or simpler request" };
   if (raw === "SESSION_ACCOUNT_ISOLATED" || raw === "SESSION_ACCOUNT_MISSING") return { code: "session_account_unavailable", message: "the account bound to this conversation is unavailable" };
   if (raw === "WS_DIAL_FAILED:503") return { code: "upstream_overloaded", message: "Microsoft ChatHub is temporarily overloaded; retry later" };
+  if (raw === "WS_DIAL_FAILED:429") return { code: "upstream_rate_limit", message: "Microsoft ChatHub is temporarily rate-limited; retry later" };
+  if (raw === "WS_DIAL_FAILED:401") return { code: "upstream_auth_error", message: "Microsoft ChatHub rejected the stored account credentials" };
+  if (raw === "WS_DIAL_FAILED:403") return { code: "upstream_forbidden", message: "Microsoft ChatHub refused this account for the request" };
+  if (/^WS_DIAL_FAILED:4\d\d$/u.test(raw)) return { code: "upstream_request_rejected", message: `Microsoft ChatHub rejected the request (HTTP ${raw.slice(-3)})` };
   if (raw.startsWith("WS_DIAL_FAILED:") || raw === "WS_DIAL_ERROR") return { code: "upstream_connect_error", message: "failed to connect to Microsoft ChatHub" };
   if (raw.startsWith("RELAY_DIAL_FAILED:") || raw === "RELAY_DIAL_ERROR") return { code: "upstream_relay_error", message: "the configured egress relay could not connect to Microsoft ChatHub" };
   if (raw.startsWith("WS_HANDSHAKE_")) return { code: "upstream_connect_error", message: "Microsoft ChatHub rejected or returned an invalid realtime handshake" };
   if (raw.startsWith("WS_CLOSED_BEFORE_COMPLETION") || raw.startsWith("CHAT_CLOSED_BEFORE_COMPLETION") || raw === "WS_ERROR_BEFORE_COMPLETION") return { code: "upstream_disconnected", message: "Microsoft ChatHub disconnected before completion" };
   if (raw === "CHAT_FIRST_OUTPUT_TIMEOUT") return { code: "upstream_first_output_timeout", message: "Microsoft ChatHub produced no model output before the first-output deadline" };
   if (raw === "WS_READ_TIMEOUT" || raw === "CHAT_DEADLINE_EXCEEDED" || raw === "CHAT_PROGRESS_TIMEOUT") return { code: "upstream_timeout", message: "Microsoft ChatHub timed out before completion" };
+  if (raw === "WS_WRITE_TIMEOUT") return { code: "upstream_write_timeout", message: "Microsoft ChatHub timed out while sending the request" };
+  if (raw === "WS_WRITE_FAILED") return { code: "upstream_write_error", message: "Microsoft ChatHub could not receive the request" };
   if (["WS_FRAME_TOO_LARGE", "WS_BUFFER_TOO_LARGE", "WS_FRAME_TOO_MANY_RECORDS", "CHAT_OUTPUT_TOO_LARGE", "CHAT_IMAGE_OUTPUT_TOO_LARGE"].includes(raw)) return { code: "upstream_payload_too_large", message: "Microsoft ChatHub exceeded the gateway's bounded frame or output limit" };
   if (raw === "INVALID_CHAT_HUB_ATTACHMENTS") return { code: "invalid_upstream_attachment", message: "the normalized image attachment could not be encoded for Microsoft ChatHub" };
   if (raw.startsWith("CHAT_COMPLETION_ERROR") || raw.startsWith("CHAT_UPSTREAM_ERROR") || raw === "CHAT_RETURNED_NO_CONTENT") return { code: "upstream_response_error", message: "Microsoft ChatHub returned an incomplete or failed response" };
@@ -1479,6 +1489,16 @@ export function internalFailureCode(cause: unknown): string {
   if (/^[A-Z][A-Z0-9_]{1,63}$/u.test(prefix)) return prefix;
   const name = cause instanceof Error ? cause.name : "UnknownError";
   return /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/u.test(name) ? name : "UnknownError";
+}
+
+export function upstreamFailureStatus(cause: unknown): number {
+  const raw = cause instanceof Error ? cause.message : "";
+  const handshake = /^(?:WS|RELAY)_DIAL_FAILED:([45]\d\d)$/u.exec(raw);
+  if (handshake) return Number(handshake[1]);
+  if (["WS_READ_TIMEOUT", "WS_WRITE_TIMEOUT", "CHAT_FIRST_OUTPUT_TIMEOUT", "CHAT_PROGRESS_TIMEOUT", "CHAT_DEADLINE_EXCEEDED", "OFFICIAL_UPSTREAM_TIMEOUT"].includes(raw)) return 504;
+  if (["CHAT_UPSTREAM_RATE_LIMITED", "CHAT_THROTTLED_QUOTA_EXHAUSTED", "MICROSOFT_TOKEN_RATE_LIMITED", "OFFICIAL_UPSTREAM_RATE_LIMITED"].includes(raw)) return 429;
+  if (["CHAT_UPSTREAM_CONTENT_BLOCKED", "OFFICIAL_UPSTREAM_UNAVAILABLE", "MICROSOFT_TOKEN_SERVICE_UNAVAILABLE"].includes(raw)) return 503;
+  return 502;
 }
 
 async function body<T>(request: Request, maxBytes = MAX_AI_REQUEST_BYTES): Promise<T> {
@@ -2430,13 +2450,37 @@ export function responsesInstructionsPrefix(
   return rendered;
 }
 
+export async function selectAccountWithRecovery(
+  state: { selectAccount(preferred?: string): Promise<AccountSelection | null>; accountPoolStatus(): Promise<AccountPoolStatus> },
+  preferred = "",
+  deadlineAt?: number,
+  signal?: AbortSignal,
+): Promise<AccountSelection | null> {
+  const recoveryDeadline = deadlineAt === undefined ? Date.now() : Math.min(deadlineAt, Date.now() + 12_000);
+  for (;;) {
+    if (signal?.aborted) throw new Error("REQUEST_ABORTED");
+    const selected = await state.selectAccount(preferred);
+    if (selected) return selected;
+    const remaining = recoveryDeadline - Date.now();
+    if (remaining <= 0) return null;
+    const pool = await state.accountPoolStatus();
+    // Wait only for imminent, known cooldown recovery. Never probe dormant
+    // accounts or wait indefinitely for reauthorization/global outages.
+    if (pool.available > 0 || pool.cooling === 0 || pool.retryAfterMs <= 0 || pool.retryAfterMs > remaining) return null;
+    const jitter = 25 + Math.floor(Math.random() * 225);
+    await abortableDelay(Math.min(remaining, pool.retryAfterMs + jitter), signal);
+  }
+}
+
 export async function accountForLease(
   env: Env,
   session: DurableObjectStub<ChatSession>,
   lease: ChatLease,
+  deadlineAt?: number,
+  signal?: AbortSignal,
 ): Promise<{ account: AccountSelection; rebound: boolean }> {
   const state = env.TENANTS.getByName(env.TENANT_NAME || "default");
-  const selection = await state.selectAccount(lease.accountId);
+  const selection = await selectAccountWithRecovery(state, lease.accountId, deadlineAt, signal);
   if (selection) {
     if (!lease.accountId) Object.assign(lease, await session.bindAccount(lease.leaseId, selection.accountId));
     return { account: selection, rebound: false };
@@ -2451,7 +2495,7 @@ export async function accountForLease(
     // move because it has already discarded its old upstream coordinates.
     // Never wake the sleeping account, detach an ordinary uncommitted turn, or
     // move a legacy committed session whose portable recovery tail is empty.
-    const active = await state.selectAccount();
+    const active = await selectAccountWithRecovery(state, "", deadlineAt, signal);
     if (active && active.accountId !== lease.accountId) {
       Object.assign(lease, await session.rebindCommittedAccount(lease.leaseId, lease.accountId, active.accountId));
       return { account: active, rebound: true };
@@ -2461,13 +2505,13 @@ export async function accountForLease(
   if (lease.accountId) {
     const availability = await state.accountAvailability(lease.accountId);
     if (availability.isolated) throw new Error("SESSION_ACCOUNT_ISOLATED");
-    if (availability.retryAfterMs > 0) throw new Error("SESSION_ACCOUNT_COOLDOWN");
+    if (availability.retryAfterMs > 0) throw new ChatHubAttemptError(new Error("SESSION_ACCOUNT_COOLDOWN"), false, false, availability.retryAfterMs);
     throw new Error("SESSION_ACCOUNT_MISSING");
   }
   {
     const pool = await state.accountPoolStatus();
     if (pool.total === 0) throw new Error("NO_ACCOUNT");
-    if (pool.cooling > 0) throw new Error("NO_HEALTHY_ACCOUNT");
+    if (pool.cooling > 0) throw new ChatHubAttemptError(new Error("NO_HEALTHY_ACCOUNT"), false, false, pool.retryAfterMs);
     throw new Error("NO_USABLE_ACCOUNT");
   }
 }
@@ -3082,7 +3126,7 @@ async function exchange(
       const disposition = classifyAccountFailure(cause);
       if (disposition) {
         try {
-          await state.reportAccountFailure(lease.accountId, disposition.kind, account.routeEpoch);
+          await state.reportAccountFailure(lease.accountId, disposition.kind, account.routeEpoch, retryAfterMilliseconds(cause));
         } catch (healthCause) {
           console.error(JSON.stringify({
             event: "account_health_update_failed",
@@ -3872,7 +3916,7 @@ async function routerExchange(
     // permanent failures still update health because they are account-scoped.
     if (disposition && disposition.kind !== "transient") {
       try {
-        await state.reportAccountFailure(account.accountId, disposition.kind, account.routeEpoch);
+        await state.reportAccountFailure(account.accountId, disposition.kind, account.routeEpoch, retryAfterMilliseconds(cause));
       } catch {
         console.error(JSON.stringify({ event: "tool_router_account_health_update_failed", kind: disposition.kind }));
       }
@@ -4863,7 +4907,7 @@ async function repairToolResultAnswer(
 }
 
 function directNativeToolMode(env: Pick<Env, "DIRECT_NATIVE_TOOL_MODE">): boolean {
-  return String(env.DIRECT_NATIVE_TOOL_MODE ?? "").toLowerCase() === "true";
+  return String(env.DIRECT_NATIVE_TOOL_MODE ?? "true").toLowerCase() === "true";
 }
 
 /**
@@ -6030,7 +6074,7 @@ function streamHeaders(): HeadersInit {
   };
 }
 
-function chatStream(
+async function chatStream(
   env: Env,
   session: DurableObjectStub<ChatSession>,
   lease: ChatLease,
@@ -6049,17 +6093,18 @@ function chatStream(
   downstreamSignal?: AbortSignal,
   metrics?: RequestMetricTracker,
   freshToolResult = false,
-): Response {
+): Promise<Response> {
   const id = `chatcmpl_${crypto.randomUUID().replaceAll("-", "")}`;
   const created = Math.floor(Date.now() / 1000);
   const state = env.TENANTS.getByName(env.TENANT_NAME || "default");
   const cancellation = createStreamCancellation(state, session, lease, downstreamSignal);
+  const preflight = new SSEPreflight();
   let closed = false;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let backpressuredAt = 0;
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      const send = (value: unknown): void => {
+      const send = (value: unknown, startup = false): void => {
         if (closed) return;
         const pressure = observeStreamBackpressure(backpressuredAt, controller.desiredSize);
         backpressuredAt = pressure.blockedSince;
@@ -6071,14 +6116,14 @@ function chatStream(
           return;
         }
         try {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
+          preflight.enqueue(controller, encoder.encode(`data: ${JSON.stringify(value)}\n\n`), startup);
         } catch {
           closed = true;
           void metrics?.cancel(200);
           cancellation.scheduleAbortAndRelease();
         }
       };
-      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] }, true);
       heartbeat = setInterval(() => send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: null }] }), STREAM_HEARTBEAT_MS);
       const pump = (async () => {
         try {
@@ -6141,18 +6186,19 @@ function chatStream(
             console.error(JSON.stringify({ event: "stream_failure_cleanup_failed" }));
           }
           const failure = publicFailure(cause);
-          if (wasCancelled) void metrics?.cancel(200);
-          else {
+          const earlyFailure = preflight.fail(cause);
+          if (wasCancelled && !earlyFailure) void metrics?.cancel(200);
+          else if (!earlyFailure) {
             metrics?.setFailureCode(failure.code);
             void metrics?.error(200);
           }
-          send({ error: { type: cause instanceof ToolLedgerBlockedError ? "invalid_request_error" : "upstream_error", ...failure } });
+          if (!earlyFailure) send({ error: { type: cause instanceof ToolLedgerBlockedError ? "invalid_request_error" : "upstream_error", ...failure } });
         } finally {
           if (heartbeat) clearInterval(heartbeat);
           cancellation.dispose();
           if (!closed) {
             try {
-              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              if (!preflight.failed) controller.enqueue(encoder.encode("data: [DONE]\n\n"));
               controller.close();
             } catch { /* downstream already disconnected */ }
             closed = true;
@@ -6162,12 +6208,14 @@ function chatStream(
       waitUntil(pump);
     },
     async cancel() {
+      preflight.fail(new Error("REQUEST_ABORTED"));
       closed = true;
       if (heartbeat) clearInterval(heartbeat);
       void metrics?.cancel(200);
       await cancellation.abortAndRelease();
     },
   });
+  await preflight.ready;
   return new Response(stream, { headers: streamHeaders() });
 }
 
@@ -6287,7 +6335,7 @@ async function chatCompletions(request: Request, env: Env, metrics?: RequestMetr
   }
   let account: AccountSelection;
   try {
-    const resolution = await accountForLease(env, session, lease);
+    const resolution = await accountForLease(env, session, lease, deadlineAt, request.signal);
     account = resolution.account;
     metrics?.setAccountId(account.accountId);
     if (resolution.rebound || restoreCheckpointHistory || shouldRestorePortableTaskFollowup(lease, currentTurnPrompt)) {
@@ -7518,7 +7566,7 @@ async function responsesCore(
   }
   let account: AccountSelection;
   try {
-    const resolution = await accountForLease(env, session, lease);
+    const resolution = await accountForLease(env, session, lease, deadlineAt, signal);
     account = resolution.account;
     metrics?.setAccountId(account.accountId);
     // A routing checkpoint deliberately abandons its upstream coordinates but
@@ -7796,7 +7844,7 @@ async function responses(request: Request, env: Env, metrics?: RequestMetricTrac
   ]);
   if (typeof quick === "symbol") return bridgePendingResponsesStream(pending, () => bridgeAbort.abort(), streamLifecycle, metrics);
   if ("cause" in quick) {
-    return bridgePendingResponsesStream(Promise.reject(quick.cause), () => bridgeAbort.abort(), streamLifecycle, metrics);
+    throw quick.cause;
   }
   claimResponsesTerminalDelivery(quick.response, "direct");
   return quick.response;
@@ -7946,6 +7994,8 @@ export async function openAIRequest(
       return apiError(multimodal.status, multimodal.code, multimodal.message);
     }
     const code = cause instanceof Error ? cause.message : "REQUEST_FAILED";
+    const retryAfterMs = retryAfterMilliseconds(cause);
+    const retryHeaders = retryAfterMs ? { "Retry-After": String(Math.ceil(retryAfterMs / 1_000)) } : undefined;
     if (code === "EMPTY_PROMPT") return apiError(400, "invalid_request_error", "a non-empty prompt is required");
     if (code === "INVALID_IMAGE_REQUEST") return apiError(400, "invalid_image_request", "image request fields or multipart image data are invalid");
     if (code === "INVALID_IMAGE_MODEL") return apiError(400, "invalid_image_model", "image requests support flux-3 or flux-4 (legacy m365-image is also accepted)");
@@ -7973,21 +8023,21 @@ export async function openAIRequest(
     if (code === "CURRENT_TURN_TOO_LARGE") return apiError(400, "context_length_exceeded", "the current user/tool turn exceeds this model's input limit and cannot be truncated safely");
     if (code === "TOOL_DEFINITIONS_EXCEED_MODEL_CONTEXT") return apiError(413, "tools_exceed_context", "tool definitions leave too little usable context for this model");
     if (code === "NO_ACCOUNT") return apiError(503, "no_account", "no Microsoft 365 account is configured");
-    if (code === "NO_HEALTHY_ACCOUNT" || code === "SESSION_ACCOUNT_COOLDOWN") return apiError(429, "account_cooldown", "all eligible Microsoft 365 accounts are cooling down; retry later");
+    if (code === "NO_HEALTHY_ACCOUNT" || code === "SESSION_ACCOUNT_COOLDOWN") return apiError(429, "account_cooldown", "all eligible Microsoft 365 accounts are cooling down; retry later", retryHeaders);
     if (code === "NO_USABLE_ACCOUNT") return apiError(503, "account_pool_isolated", "all Microsoft 365 accounts require administrator attention");
     if (code === "SESSION_ACCOUNT_ISOLATED" || code === "SESSION_ACCOUNT_MISSING" || code === "ACCOUNT_MISSING") return apiError(503, "session_account_unavailable", "the account bound to this conversation is unavailable");
     if (code === "CONVERSATION_BUSY") return apiError(409, "conversation_busy", "this conversation already has an active request", { "Retry-After": "1" });
     if (code === "CHAT_RUN_ALREADY_ACTIVE") return apiError(409, "conversation_busy", "this conversation already has an active request", { "Retry-After": "1" });
     if (code === "ACCOUNT_QUEUE_TIMEOUT") return apiError(429, "account_busy", "the Microsoft 365 account is busy; retry later");
-    if (code === "CHAT_THROTTLED_QUOTA_EXHAUSTED") return apiError(429, "upstream_throttled", "the selected Microsoft 365 account has exhausted its current allowance");
-    if (code === "CHAT_UPSTREAM_RATE_LIMITED") return apiError(429, "upstream_rate_limit", "Microsoft ChatHub is temporarily rate-limited; retry later");
-    if (code === "WS_DIAL_FAILED:503") return apiError(503, "upstream_overloaded", "Microsoft ChatHub is temporarily overloaded; retry later");
+    if (code === "CHAT_THROTTLED_QUOTA_EXHAUSTED") return apiError(429, "upstream_throttled", "the selected Microsoft 365 account has exhausted its current allowance", retryHeaders);
+    if (code === "CHAT_UPSTREAM_RATE_LIMITED") return apiError(429, "upstream_rate_limit", "Microsoft ChatHub is temporarily rate-limited; retry later", retryHeaders);
+    if (code === "WS_DIAL_FAILED:503") return apiError(503, "upstream_overloaded", "Microsoft ChatHub is temporarily overloaded; retry later", retryHeaders);
     if (code === "UNSUPPORTED_MODEL") return apiError(400, "unsupported_model", "the requested model is not supported by this gateway");
     if (code === "TOOL_DECISION_INVALID") return apiError(502, "tool_decision_invalid", "Microsoft 365 returned a malformed tool decision");
     if (code === "TOOL_CALL_GENERATION_FAILED") return apiError(502, "tool_call_generation_failed", "the model did not produce a valid required function call after bounded repair");
     const failure = publicFailure(cause);
     const internalCode = internalFailureCode(cause);
     console.error(JSON.stringify({ event: "openai_request_failed", code: failure.code, internal_code: internalCode }));
-    return apiError(502, failure.code, failure.message, { "X-M365-Internal-Code": internalCode });
+    return apiError(upstreamFailureStatus(cause), failure.code, failure.message, { "X-M365-Internal-Code": internalCode, ...retryHeaders });
   }
 }
