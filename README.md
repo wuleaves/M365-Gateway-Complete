@@ -1,7 +1,9 @@
 # M365 Gateway 完整包
 
-版本：`0.2.3`
+版本：`0.2.4`
 部署形态：Cloudflare Workers，或 Node.js/Docker 独立服务器；均可搭配固定目标 Go 出口 Relay
+
+[English](README.en.md) · [上游 v0.7.3 完整核对与升级说明](UPGRADE-0.2.4.md)
 
 本完整包以 `M365-Gateway-Cloudflare-UI-Mobile-20260917-r9` 为主线，合并了此前各源码包中仍被当前实现引用但在 r9 压缩包中漏装的可选 Go 出口 Relay，并保留 Cloudflare、Node/Docker、MFA、现代化管理界面与完整测试。
 
@@ -139,9 +141,17 @@ Codex 的 Responses 续接允许省略重复的固定调用方工具声明（`ex
 
 公开模型清单以 [M365-Copilot2API 上游目录](https://github.com/HEXUXIU/M365-Copilot2API/blob/main/internal/web/codex_catalog.go) 为准，移除非上游 0.7.x 公共名称；旧名称只用于请求兼容。图片端点默认 `flux-3`，也接受 `flux-4` 和旧名称 `m365-image`。图片模型均走 Microsoft Magic 路由，名称作为上游提示的一部分；实际底层权重和可用性仍由租户决定。此变更只更新代码和模型清单，不自动部署现有 Cloudflare 服务。
 
+### 0.2.4 跟随上游 v0.7.3
+
+已核对从 `056c028` 到固定标签 `v0.7.3`（`c6181d2`）的全部 15 个提交。更新包括默认 40 秒首输出期限、可取消且有抖动的账号冷却恢复等待、`Retry-After` 冷却提示、写入超时分类、流式早期错误的真实 HTTP 状态、实体标签清理、固定“无法回答”回复识别、管理员 SLA 指标，以及两套管理界面的中英文切换。现有 Codex `additional_tools` 与 custom-tool 参数分块完整性已有专项回归。
+
+新增受管理员保护的 `GET /api/metrics`（别名 `/api/admin/metrics`）。请求和错误计数覆盖全部请求，包含 HTTP 200 的 SSE 语义失败；延迟 p50/p95/p99 为有界直方图桶上界估计，响应明示算法和边界。统计窗口从升级或重置后开始，不从抽样日志伪造旧数据。Worker 没有统一进程运行时间，`uptime_seconds` 返回 `null`。设置页可直接读取指标。
+
+使用右下角 English / 中文 按钮切换语言；控制台、登录/MFA 与诊断兼容页共享浏览器 `m365_locale` 设置。已保存的首输出超时值不自动覆盖。上游已接收的 invocation 仍不自动跨账号重放，避免重复执行；超时账号的后续路由与便携历史恢复继续生效。Go 连接池、常驻进程功能和任意代理没有加入 Worker 运行时。全部提交对应的实现与适配差异见 [0.2.4 升级说明](UPGRADE-0.2.4.md)。
+
 ## 本地验证
 
-要求 Node.js 20 或更高版本。
+要求 Node.js 22 或更高版本（当前锁定的 Wrangler 及 Docker 镜像均使用此运行边界）。
 
 ```powershell
 cd M365-Gateway-Cloudflare-0.1.0
@@ -213,7 +223,7 @@ node .\deploy-cloudflare.mjs --dry-run --yes --name m365-gateway-check --client-
 
 ### 第 0 步：准备环境
 
-1. 安装 Node.js 20 或更高版本（建议当前 LTS），安装完成后重新打开终端。
+1. 安装 Node.js 22 或更高版本（建议当前 LTS），安装完成后重新打开终端。
 2. 确认 Node.js、npm 和 Wrangler 能运行：
 
    ```powershell

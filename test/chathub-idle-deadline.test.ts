@@ -58,7 +58,7 @@ describe("bounded ChatHub idle and overall deadlines", () => {
     vi.useFakeTimers();
     const run = start();
     await run.socket.submitted;
-    await vi.advanceTimersByTimeAsync(74_999);
+    await vi.advanceTimersByTimeAsync(39_999);
     expect(run.settled()).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
     const outcome = await run.outcome;
@@ -77,7 +77,7 @@ describe("bounded ChatHub idle and overall deadlines", () => {
     await run.socket.submitted;
     const interval = setInterval(() => run.socket.receive({ type: 6 }), 30_000);
     try {
-      await vi.advanceTimersByTimeAsync(75_000);
+      await vi.advanceTimersByTimeAsync(40_000);
       const outcome = await run.outcome;
       expect(outcome.error).toMatchObject({ message: "CHAT_FIRST_OUTPUT_TIMEOUT" });
       expect(run.socket.invocationCount).toBe(1);

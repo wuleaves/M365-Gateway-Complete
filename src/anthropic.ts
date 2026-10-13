@@ -455,8 +455,16 @@ const stableErrorMessages: Record<string, string> = {
   tool_output_mismatch: "the tool result does not match a pending call",
   invalid_tool_history: "the structured tool-call history is invalid",
   upstream_connect_error: "failed to connect to Microsoft ChatHub",
+  upstream_auth_error: "Microsoft ChatHub rejected the stored account credentials",
+  upstream_forbidden: "Microsoft ChatHub refused this account for the request",
+  upstream_request_rejected: "Microsoft ChatHub rejected the request",
+  upstream_write_error: "Microsoft ChatHub could not receive the request",
   upstream_disconnected: "Microsoft ChatHub disconnected before completion",
   upstream_timeout: "Microsoft ChatHub timed out before completion",
+  upstream_write_timeout: "Microsoft ChatHub timed out while sending the request",
+  upstream_first_output_timeout: "Microsoft ChatHub produced no output before the first-output deadline",
+  upstream_overloaded: "Microsoft ChatHub is temporarily overloaded; retry later",
+  upstream_content_blocked: "Microsoft 365 could not answer this request; revise the request or retry later",
   upstream_response_error: "Microsoft ChatHub returned an incomplete or failed response",
   upstream_error: "Microsoft ChatHub request failed",
 };
@@ -464,7 +472,7 @@ const stableErrorMessages: Record<string, string> = {
 function errorType(status: number, code: string): AnthropicErrorType {
   if (status === 401 || status === 403 || code === "auth_error") return "authentication_error";
   if (status === 429 || ["account_cooldown", "account_busy", "upstream_throttled", "upstream_rate_limit"].includes(code)) return "rate_limit_error";
-  if (status === 529) return "overloaded_error";
+  if (status === 529 || code === "upstream_overloaded") return "overloaded_error";
   if (status >= 500) return "api_error";
   return "invalid_request_error";
 }
@@ -487,9 +495,10 @@ async function mapErrorResponse(response: Response): Promise<Response> {
   }
   const failure = mappedError(response.status, parsed);
   const internalCode = response.headers.get("X-M365-Internal-Code");
-  const diagnosticHeaders = internalCode && /^[A-Z][A-Z0-9_]{1,63}$/u.test(internalCode)
-    ? { "X-M365-Internal-Code": internalCode }
-    : undefined;
+  const diagnosticHeaders: Record<string, string> = {};
+  if (internalCode && /^[A-Z][A-Z0-9_]{1,63}$/u.test(internalCode)) diagnosticHeaders["X-M365-Internal-Code"] = internalCode;
+  const retryAfter = response.headers.get("Retry-After");
+  if (retryAfter && /^\d{1,5}$/u.test(retryAfter)) diagnosticHeaders["Retry-After"] = retryAfter;
   return anthropicErrorResponse(response.status, failure.type, failure.message, failure.code, diagnosticHeaders);
 }
 

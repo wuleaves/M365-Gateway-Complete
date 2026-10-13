@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   chatHub,
+  ChatHubAttemptError,
   chatHubInvocationWasSubmitted,
   isTerminalEmptyQuotaFailure,
   type ChatHubRelay,
@@ -407,6 +408,7 @@ export type DurableChatHubOutcome =
         message: string;
         invocationSubmitted: boolean;
         terminalEmptyQuota: boolean;
+        retryAfterMs?: number;
       };
     };
 
@@ -589,6 +591,7 @@ export class ChatSession extends DurableObject<Env> {
             message: message.slice(0, 2_048),
             invocationSubmitted: chatHubInvocationWasSubmitted(cause),
             terminalEmptyQuota: isTerminalEmptyQuotaFailure(cause),
+            retryAfterMs: cause instanceof ChatHubAttemptError ? cause.retryAfterMs : 0,
           },
         };
       }
