@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.4 — 2026-11-04
+
+- Adapted the upstream v0.7.3 read-only metrics feature to a Cloudflare-safe, administrator-only `/api/admin/metrics` endpoint. Exact request/error and per-endpoint counts remain separate from explicitly biased diagnostic-sample latency percentiles.
+- Added tests for aggregate metrics, administrator access control and the stream suffix following a code fence.
+- Audited upstream Codex `additional_tools`, stream fence, first-output timeout and account failover changes against existing gateway behavior. Kept the 75-second default timeout because this gateway does not replay an already-submitted invocation across accounts.
+
+## 0.2.3 — 2026-10-02
+
+- Aligned the public model catalog with the upstream 0.7.x identifiers while retaining previous IDs as request-only compatibility entries.
+- Exposed `flux-3` and `flux-4` on image endpoints; both currently use the same Microsoft Magic route, so distinct underlying weights are not guaranteed.
+
 ## 0.2.2 — 2026-10-01
 
 - Protected recent client-bound cloud conversations during administrator cleanup and deletion. Conversations without a reliable last-activity timestamp are skipped instead of being deleted by creation age alone.

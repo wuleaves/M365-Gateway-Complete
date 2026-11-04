@@ -408,6 +408,9 @@ async function adminRoute(request: Request, env: Env, url: URL): Promise<Respons
     const limit = Number.parseInt(url.searchParams.get("limit") ?? "500", 10);
     return json({ totals: await state.statsSnapshot(), dimensions: await state.usageDimensionStats(limit) });
   }
+  if (url.pathname === "/api/admin/metrics" && request.method === "GET") {
+    return json(await state.slaMetricsSnapshot());
+  }
   if (url.pathname === "/api/admin/usage/reuse" && request.method === "GET") {
     return json(await state.sessionReuseStats());
   }

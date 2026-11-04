@@ -41,6 +41,24 @@ async function finishTotp(response: Response): Promise<Response> {
 }
 
 describe("Worker HTTP contract", () => {
+  it("keeps the metrics endpoint administrator-only and reports exact aggregate counts", async () => {
+    const anonymous = await SELF.fetch("https://example.com/api/admin/metrics");
+    expect(anonymous.status).toBe(401);
+    const state = env.TENANTS.getByName(`sla-${crypto.randomUUID()}`);
+    const apiKey = await state.createAPIKey("metrics-test", 1);
+    await state.recordRequestAggregate({
+      requestId: crypto.randomUUID(), status: 200, apiKeyId: apiKey.record.id, model: "gpt-5.5", endpoint: "responses", durationMs: 12,
+    });
+    await state.recordRequest({
+      requestId: crypto.randomUUID(), status: 503, apiKeyId: apiKey.record.id, model: "gpt-5.5", endpoint: "responses", durationMs: 30,
+    });
+    const snapshot = await state.slaMetricsSnapshot();
+    expect(snapshot).toMatchObject({
+      requests: 2, errors: 1, success_rate: 0.5,
+      latency_ms: { sampleSize: 1, method: "biased_diagnostic_sample" },
+      per_endpoint: [{ endpoint: "responses", requests: 2, errors: 1, success_rate: 0.5 }],
+    });
+  });
   it("accumulates exact minute usage and successful session reuse without a per-request history row", async () => {
     const state = env.TENANTS.getByName(`usage-${crypto.randomUUID()}`);
     await state.recordRequestAggregate({ requestId: crypto.randomUUID(), status: 200, tokenIn: 8, tokenOut: 2, sessionReused: false });

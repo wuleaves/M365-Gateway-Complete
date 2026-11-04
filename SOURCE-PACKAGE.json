@@ -1,12 +1,12 @@
 {
   "package": "M365-Gateway-Complete",
-  "version": "0.2.2",
+  "version": "0.2.4",
   "createdAt": "2026-09-29T22:00:00+08:00",
-  "updatedAt": "2026-10-01T21:24:00+08:00",
+  "updatedAt": "2026-11-04T15:27:48+08:00",
   "source": "consolidated-from-supplied-archives",
   "base": "M365-Gateway-Cloudflare-UI-Mobile-20260917-r9.zip",
   "restoredFrom": "M365-Gateway-OpenSource-20260913.zip",
-  "compatibilityReference": "M365-Copilot2API main at 056c028; portable behavior independently reimplemented for Cloudflare",
+  "compatibilityReference": "M365-Copilot2API v0.7.3 at c6181d2; portable behavior independently reimplemented for Cloudflare",
   "includes": [
     "Cloudflare Worker TypeScript source and deployment helper",
     "Node.js and Docker server runtime",
@@ -16,7 +16,7 @@
     "public reasoning_content plus Anthropic thinking, bounded Responses metadata and cross-chunk citation cleanup",
     "explicit sessions, file/audio media, image generation/edit/variation and first-output timeout",
     "cloud conversations with bound-session cleanup protection, memory, plugins, MCP, runtime models, account health, usage dimensions and timezone-aware trends",
-    "registered session management and exact successful session-reuse counts",
+    "registered session management, exact successful session-reuse counts and administrator-only sampled-latency metrics",
     "optional fixed-target Go egress relay"
   ],
   "excludes": [
@@ -30,8 +30,8 @@
     "npmCheck": "passed",
     "typecheck": "passed",
     "adminUiContract": "passed",
-    "testFiles": 30,
-    "tests": 524,
+    "testFiles": 31,
+    "tests": 527,
     "cloudflareDryRun": "passed",
     "npmAudit": "dependency-set-unchanged; network advisory check not rerun",
     "secretScan": "passed-no-findings",

@@ -1426,6 +1426,8 @@ describe("ChatHub snapshot folding", () => {
     expect(streamTextSuffix("hello", "hello world")).toBe(" world");
     expect(streamTextSuffix("hello world", "hello world")).toBe("");
     expect(streamTextSuffix("hello world", "hello")).toBe("");
+    expect(streamTextSuffix("```ts\nconst value = 1;\n```", "```ts\nconst value = 1;\n```\nThe result is 1."))
+      .toBe("\nThe result is 1.");
   });
 });
 

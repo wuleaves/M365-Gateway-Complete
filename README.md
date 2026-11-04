@@ -1,6 +1,6 @@
 # M365 Gateway 完整包
 
-版本：`0.2.3`
+版本：`0.2.4`
 部署形态：Cloudflare Workers，或 Node.js/Docker 独立服务器；均可搭配固定目标 Go 出口 Relay
 
 本完整包以 `M365-Gateway-Cloudflare-UI-Mobile-20260917-r9` 为主线，合并了此前各源码包中仍被当前实现引用但在 r9 压缩包中漏装的可选 Go 出口 Relay，并保留 Cloudflare、Node/Docker、MFA、现代化管理界面与完整测试。
@@ -138,6 +138,10 @@ Codex 的 Responses 续接允许省略重复的固定调用方工具声明（`ex
 ### 0.2.3 模型名称对齐
 
 公开模型清单以 [M365-Copilot2API 上游目录](https://github.com/HEXUXIU/M365-Copilot2API/blob/main/internal/web/codex_catalog.go) 为准，移除非上游 0.7.x 公共名称；旧名称只用于请求兼容。图片端点默认 `flux-3`，也接受 `flux-4` 和旧名称 `m365-image`。图片模型均走 Microsoft Magic 路由，名称作为上游提示的一部分；实际底层权重和可用性仍由租户决定。此变更只更新代码和模型清单，不自动部署现有 Cloudflare 服务。
+
+### 0.2.4 上游 v0.7.3 适配
+
+新增仅管理员可读的 `/api/admin/metrics`，显示准确的累计请求数、错误数、成功率、按端点汇总以及账号状态。延迟分位数来自有界诊断样本（保留全部错误和慢请求，仅抽样普通成功请求），响应中的 `latency_ms.method=biased_diagnostic_sample` 明确指出它**不是全量 SLA 分位数**。Cloudflare Worker 实例没有稳定的进程运行时长，因此不照搬上游本地进程的 `uptime_seconds`。现有 Codex `additional_tools` 解析、流式代码块尾部保留、首次输出超时和账号路由保护已覆盖对应上游修复；75 秒默认首次输出超时保持不变，避免未确认安全的跨账号重放。参见 `UPGRADE-0.2.4.md`。
 
 ## 本地验证
 

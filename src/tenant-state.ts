@@ -5,6 +5,7 @@ import { refreshToken, scopedAccessToken, type ScopedAccessToken } from "./oauth
 import { parsePasskeyRegistration, randomChallenge, verifyPasskeyAssertion, verifyTOTP } from "./mfa";
 import type { MigratedAccountInput } from "./migration";
 import { normalizeRuntimeModelConfiguration, type RuntimeModelConfiguration } from "./models";
+import { buildSlaMetricsSnapshot } from "./sla-metrics";
 import { aggregateUsageTrend, type UsageTrendRow } from "./usage-trend";
 import type {
   AccountEgress,
@@ -1373,6 +1374,21 @@ export class TenantState extends DurableObject<Env> {
       totalTokenOut: row.token_out,
       lastRequestAt: row.last_request_at > 0 ? new Date(row.last_request_at).toISOString() : null,
     };
+  }
+
+  /** Administrator-only aggregate snapshot. Exact request/error counters come
+   * from the accounting tables; latency uses the bounded diagnostic sample
+   * and is explicitly marked non-representative of all requests. */
+  async slaMetricsSnapshot(): Promise<ReturnType<typeof buildSlaMetricsSnapshot>> {
+    const { accounts, totals } = await this.accountsSnapshot();
+    const endpoints = this.ctx.storage.sql.exec<{
+      endpoint: string; requests: number; errors: number;
+    }>(
+      `SELECT endpoint,SUM(request_count) AS requests,SUM(error_count) AS errors
+       FROM request_dimension_stats GROUP BY endpoint`,
+    ).toArray();
+    const latency = await this.listRequestMetrics(MAX_DIAGNOSTIC_RECORDS);
+    return buildSlaMetricsSnapshot(totals, endpoints, latency, accounts);
   }
 
   async usageDimensionStats(limit = 500): Promise<UsageDimensionStats[]> {
